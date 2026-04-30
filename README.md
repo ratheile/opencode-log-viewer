@@ -10,17 +10,36 @@ uv sync
 
 ## Run
 
-The repository includes an example database at `opencode/opencode.db`, so the default command works from the project root:
+The repository can be run against the local `opencode/` runs folder from the project root:
 
 ```bash
-uv run opencode-viewer --show
+uv run opencode-viewer --db ./opencode --show
 ```
 
-To point at another database:
+When `--db` points at a folder, the viewer scans for `*/opencode/opencode.db`, selects the first run, and lets you switch runs from the dashboard. You can also point at a single database file:
 
 ```bash
 uv run opencode-viewer --db /path/to/opencode.db --show
 ```
+
+Or a folder outside the repo with the same run layout:
+
+```bash
+uv run opencode-viewer --db ../opencode --show
+```
+
+Runs currently present under `./opencode`:
+
+- `battery-soh-pipeline-enforced-bs-0-1`
+- `battnn-pinn-eod-enforced-bs-0-1`
+- `battnn-pinn-eod-safety-relaxed-0-1`
+- `bayesian-gated-transformer-rul`
+- `cart-net-aeroengine-rul`
+- `cata-tcn-engine-rul-30-04`
+- `ica-transformer-soh-safety-relaxed-0-3`
+- `lstm-ae-health-rul-30-04-0-1`
+- `vmd-ssa-patchtst-battery-rul-light-test`
+- `vmd-ssa-patchtst-battery-rul-safety-relaxed`
 
 You can also set `OPENCODE_DB_PATH`:
 
@@ -36,4 +55,3 @@ The app reads the SQLite database in read-only mode and summarizes sessions, mes
 uv run pytest
 uv run ruff check .
 ```
-

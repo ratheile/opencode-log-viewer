@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import time
 from collections.abc import Iterable
@@ -14,6 +15,9 @@ from urllib.parse import quote
 import pandas as pd
 
 DEFAULT_DB_PATH = Path(os.environ.get("OPENCODE_DB_PATH", "opencode/opencode.db"))
+SENSITIVE_COLUMNS = {"access_token", "refresh_token", "secret"}
+TASK_ID_RE = re.compile(r"task_id:\s*(ses_[A-Za-z0-9]+)")
+PATH_RE = re.compile(r"(?P<path>/(?:[^\s`<>\")]+))")
 
 
 def resolve_db_path(path: str | Path | None = None) -> Path:
@@ -34,6 +38,14 @@ def _load_json(raw: str | None) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {"_raw": raw}
     return loaded if isinstance(loaded, dict) else {"value": loaded}
+
+
+def _dump_json(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False, indent=2, default=str)
 
 
 def _format_time_ms(value: Any) -> str:
@@ -66,6 +78,44 @@ def _preview(value: Any, limit: int = 280) -> str:
     return f"{value[: limit - 1]}..."
 
 
+def _read_text_preview(path: Path, limit: int = 120_000) -> str:
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            return handle.read(limit)
+    except OSError as exc:
+        return f"Unable to read {path}: {exc}"
+
+
+def _model_id(data: dict[str, Any]) -> str:
+    if data.get("modelID"):
+        return str(data["modelID"])
+    model = data.get("model") or {}
+    if isinstance(model, dict):
+        return str(model.get("modelID") or model.get("id") or model.get("name") or "")
+    return ""
+
+
+def _provider_id(data: dict[str, Any]) -> str:
+    if data.get("providerID"):
+        return str(data["providerID"])
+    model = data.get("model") or {}
+    if isinstance(model, dict):
+        return str(model.get("providerID") or model.get("provider") or "")
+    return ""
+
+
+def _extract_paths(value: Any) -> list[str]:
+    text = _dump_json(value)
+    paths = []
+    seen = set()
+    for match in PATH_RE.finditer(text):
+        path = match.group("path").rstrip(".,;:")
+        if path not in seen:
+            seen.add(path)
+            paths.append(path)
+    return paths
+
+
 @dataclass(frozen=True)
 class SessionDiff:
     file: str
@@ -85,6 +135,14 @@ class OpenCodeStore:
     @property
     def storage_dir(self) -> Path:
         return self.db_path.parent / "storage"
+
+    @property
+    def log_dir(self) -> Path:
+        return self.db_path.parent / "log"
+
+    @property
+    def tool_output_dir(self) -> Path:
+        return self.db_path.parent / "tool-output"
 
     def connect(self) -> sqlite3.Connection:
         if not self.db_path.exists():
@@ -108,6 +166,39 @@ class OpenCodeStore:
         if last_error:
             raise last_error
         return []
+
+    def table_names(self) -> list[str]:
+        rows = self.rows(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'table'
+            ORDER BY name
+            """
+        )
+        return [str(row["name"]) for row in rows]
+
+    def has_table(self, table: str) -> bool:
+        return table in set(self.table_names())
+
+    def db_overview(self) -> pd.DataFrame:
+        records = []
+        for table in self.table_names():
+            count = int(self.rows(f'SELECT COUNT(*) AS count FROM "{table}"')[0]["count"])
+            records.append({"table": table, "rows": count})
+        return pd.DataFrame(records)
+
+    def migrations(self) -> pd.DataFrame:
+        if not self.has_table("__drizzle_migrations"):
+            return pd.DataFrame(columns=["id", "name", "applied_at"])
+        rows = self.rows(
+            """
+            SELECT id, name, applied_at
+            FROM __drizzle_migrations
+            ORDER BY id
+            """
+        )
+        return pd.DataFrame([dict(row) for row in rows])
 
     def sessions(self, include_archived: bool = False) -> pd.DataFrame:
         where = "" if include_archived else "WHERE s.time_archived IS NULL"
@@ -166,6 +257,16 @@ class OpenCodeStore:
             frame = frame.merge(message_stats, left_on="id", right_on="session_id", how="left")
             frame = frame.drop(columns=["session_id"])
 
+        part_stats = self.part_stats()
+        if not part_stats.empty:
+            frame = frame.merge(part_stats, left_on="id", right_on="session_id", how="left")
+            frame = frame.drop(columns=["session_id"])
+
+        child_stats = self.child_session_stats()
+        if not child_stats.empty:
+            frame = frame.merge(child_stats, left_on="id", right_on="parent_id", how="left")
+            frame = frame.drop(columns=["parent_id_y"]).rename(columns={"parent_id_x": "parent_id"})
+
         numeric_columns = [
             "summary_additions",
             "summary_deletions",
@@ -179,6 +280,10 @@ class OpenCodeStore:
             "token_reasoning",
             "cache_read",
             "cache_write",
+            "tool_count",
+            "task_count",
+            "error_count",
+            "child_session_count",
         ]
         for column in numeric_columns:
             if column not in frame:
@@ -186,6 +291,17 @@ class OpenCodeStore:
             frame[column] = frame[column].fillna(0)
 
         return frame
+
+    def child_session_stats(self) -> pd.DataFrame:
+        rows = self.rows(
+            """
+            SELECT parent_id, COUNT(*) AS child_session_count
+            FROM session
+            WHERE parent_id IS NOT NULL
+            GROUP BY parent_id
+            """
+        )
+        return pd.DataFrame([dict(row) for row in rows])
 
     def message_stats(self) -> pd.DataFrame:
         messages = self.messages()
@@ -201,6 +317,17 @@ class OpenCodeStore:
             cache_write=("cache_write", "sum"),
         )
         grouped["total_cost"] = grouped["total_cost"].round(6)
+        return grouped
+
+    def part_stats(self) -> pd.DataFrame:
+        parts = self.all_parts()
+        if parts.empty:
+            return pd.DataFrame()
+        grouped = parts.groupby("session_id", as_index=False).agg(
+            tool_count=("is_tool", "sum"),
+            task_count=("is_task", "sum"),
+            error_count=("is_error", "sum"),
+        )
         return grouped
 
     def messages(self, session_id: str | None = None) -> pd.DataFrame:
@@ -229,8 +356,8 @@ class OpenCodeStore:
                     "role": data.get("role", ""),
                     "agent": data.get("agent", ""),
                     "mode": data.get("mode", ""),
-                    "model_id": data.get("modelID", ""),
-                    "provider_id": data.get("providerID", ""),
+                    "model_id": _model_id(data),
+                    "provider_id": _provider_id(data),
                     "finish": data.get("finish", ""),
                     "cost": float(data.get("cost") or 0),
                     "token_total": _tokens(data, "total"),
@@ -248,37 +375,57 @@ class OpenCodeStore:
             )
         return pd.DataFrame(records)
 
-    def parts(self, session_id: str) -> pd.DataFrame:
+    def all_parts(self, session_id: str | None = None) -> pd.DataFrame:
+        where = ""
+        params: tuple[str, ...] = ()
+        if session_id:
+            where = "WHERE session_id = ?"
+            params = (session_id,)
         rows = self.rows(
-            """
+            f"""
             SELECT id, message_id, session_id, time_created, time_updated, data
             FROM part
-            WHERE session_id = ?
+            {where}
             ORDER BY time_created ASC
             """,
-            (session_id,),
+            params,
         )
         records = []
         for row in rows:
             data = _load_json(row["data"])
             part_type = data.get("type", "")
             state = data.get("state") or {}
+            output = state.get("output") or state.get("out")
+            error = state.get("error")
+            tool = data.get("tool", "")
             records.append(
                 {
                     "id": row["id"],
                     "message_id": row["message_id"],
                     "session_id": row["session_id"],
                     "type": part_type,
-                    "tool": data.get("tool", ""),
+                    "tool": tool,
                     "status": state.get("status", ""),
+                    "input": state.get("input"),
+                    "output": output,
+                    "error": error,
+                    "output_len": len(str(output or "")),
+                    "task_id": self._task_id(data),
+                    "paths": _extract_paths(state.get("input")) + _extract_paths(output),
                     "created": _format_time_ms(row["time_created"]),
                     "updated": _format_time_ms(row["time_updated"]),
                     "preview": _preview(self._part_content(data)),
                     "content": self._part_content(data),
+                    "is_tool": part_type == "tool",
+                    "is_task": part_type == "tool" and tool == "task",
+                    "is_error": state.get("status") == "error" or bool(error),
                     "raw": data,
                 }
             )
         return pd.DataFrame(records)
+
+    def parts(self, session_id: str) -> pd.DataFrame:
+        return self.all_parts(session_id)
 
     def transcript(self, session_id: str) -> pd.DataFrame:
         messages = self.messages(session_id)
@@ -305,6 +452,135 @@ class OpenCodeStore:
             )
         return pd.DataFrame(records)
 
+    def tools(self, session_id: str) -> pd.DataFrame:
+        parts = self.parts(session_id)
+        if parts.empty:
+            return pd.DataFrame(
+                columns=[
+                    "created",
+                    "tool",
+                    "status",
+                    "task_id",
+                    "output_len",
+                    "preview",
+                    "input_text",
+                    "output_text",
+                    "error",
+                ]
+            )
+        tools = parts[parts["type"] == "tool"].copy()
+        if tools.empty:
+            return tools
+        tools["input_text"] = tools["input"].map(_dump_json)
+        tools["output_text"] = tools["output"].map(_dump_json)
+        tools["path_count"] = tools["paths"].map(len)
+        return tools
+
+    def subagents(self, session_id: str) -> pd.DataFrame:
+        children = self.rows(
+            """
+            SELECT id, parent_id, title, slug, time_created, time_updated
+            FROM session
+            WHERE parent_id = ?
+            ORDER BY time_created ASC
+            """,
+            (session_id,),
+        )
+        child_records = {
+            row["id"]: {
+                "child_session_id": row["id"],
+                "parent_id": row["parent_id"],
+                "child_title": row["title"],
+                "child_slug": row["slug"],
+                "child_created": _format_time_ms(row["time_created"]),
+                "child_updated": _format_time_ms(row["time_updated"]),
+            }
+            for row in children
+        }
+
+        tasks = self.tools(session_id)
+        records = []
+        if not tasks.empty:
+            for _, task in tasks[tasks["tool"] == "task"].iterrows():
+                child_id = task.get("task_id") or ""
+                if not child_id:
+                    continue
+                child = child_records.pop(child_id, {})
+                records.append(
+                    {
+                        "created": task.get("created", ""),
+                        "status": task.get("status", ""),
+                        "task_id": child_id,
+                        "description": _task_description(task.get("input")),
+                        "result_preview": _preview(task.get("output_text"), 500),
+                        **child,
+                    }
+                )
+
+        for child in child_records.values():
+            records.append(
+                {
+                    "created": child["child_created"],
+                    "status": "",
+                    "task_id": child["child_session_id"],
+                    "description": child["child_title"],
+                    "result_preview": "",
+                    **child,
+                }
+            )
+        return pd.DataFrame(records)
+
+    def workflow_phases(self, session_id: str) -> pd.DataFrame:
+        tools = self.tools(session_id)
+        if tools.empty:
+            return pd.DataFrame()
+
+        latest_state: dict[str, Any] = {}
+        for _, row in tools.iterrows():
+            if not str(row.get("tool", "")).startswith("validate_paper_workflow_"):
+                continue
+            output = _load_json(str(row.get("output") or ""))
+            state = output.get("state") if isinstance(output.get("state"), dict) else output
+            if isinstance(state, dict) and state.get("phases"):
+                latest_state = state
+
+        phases = latest_state.get("phases") or {}
+        phase_order = latest_state.get("phase_order") or list(phases)
+        records = []
+        for position, name in enumerate(phase_order):
+            phase = phases.get(name) or {}
+            records.append(
+                {
+                    "position": position + 1,
+                    "phase": name,
+                    "status": phase.get("status", ""),
+                    "attempts": phase.get("attempts", 0),
+                    "started_at": phase.get("started_at", ""),
+                    "completed_at": phase.get("completed_at", ""),
+                    "last_error": phase.get("last_error_message", ""),
+                    "artifact_count": len(phase.get("artifact_paths") or []),
+                    "artifact_paths": "\n".join(phase.get("artifact_paths") or []),
+                }
+            )
+        return pd.DataFrame(records)
+
+    def artifact_paths(self, session_id: str) -> pd.DataFrame:
+        records = []
+        for _, row in self.parts(session_id).iterrows():
+            for path in row.get("paths") or []:
+                records.append(
+                    {
+                        "created": row.get("created", ""),
+                        "source": row.get("tool") or row.get("type", ""),
+                        "status": row.get("status", ""),
+                        "path": path,
+                    }
+                )
+        if not records:
+            return pd.DataFrame(columns=["created", "source", "status", "path"])
+        frame = pd.DataFrame(records).drop_duplicates()
+        return frame.sort_values(["created", "path"]).reset_index(drop=True)
+
     def session_diff(self, session_id: str) -> pd.DataFrame:
         path = self.storage_dir / "session_diff" / f"{session_id}.json"
         if not path.exists():
@@ -324,6 +600,77 @@ class OpenCodeStore:
             )
         return pd.DataFrame([record.__dict__ for record in records])
 
+    def session_diff_files(self) -> pd.DataFrame:
+        diff_dir = self.storage_dir / "session_diff"
+        if not diff_dir.exists():
+            return pd.DataFrame(columns=["session_id", "path", "bytes"])
+        records = []
+        for path in sorted(diff_dir.glob("*.json")):
+            records.append(
+                {
+                    "session_id": path.stem,
+                    "path": str(path),
+                    "bytes": path.stat().st_size,
+                }
+            )
+        return pd.DataFrame(records)
+
+    def logs(self, session_id: str | None = None) -> pd.DataFrame:
+        if not self.log_dir.exists():
+            return pd.DataFrame(columns=["file", "line", "level", "timestamp", "service", "text"])
+        records = []
+        for path in sorted(self.log_dir.glob("*.log")):
+            try:
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            for number, line in enumerate(lines, start=1):
+                if session_id and session_id not in line:
+                    continue
+                records.append(
+                    {
+                        "file": path.name,
+                        "line": number,
+                        "level": line.split(maxsplit=1)[0] if line else "",
+                        "timestamp": _log_timestamp(line),
+                        "service": _log_service(line),
+                        "text": line,
+                        "preview": _preview(line, 500),
+                    }
+                )
+        return pd.DataFrame(records)
+
+    def tool_output_files(self) -> pd.DataFrame:
+        if not self.tool_output_dir.exists():
+            return pd.DataFrame(columns=["file", "path", "bytes", "preview", "content"])
+        records = []
+        for path in sorted(self.tool_output_dir.iterdir()):
+            if not path.is_file():
+                continue
+            content = _read_text_preview(path)
+            records.append(
+                {
+                    "file": path.name,
+                    "path": str(path),
+                    "bytes": path.stat().st_size,
+                    "preview": _preview(content, 500),
+                    "content": content,
+                }
+            )
+        return pd.DataFrame(records)
+
+    def raw_table(self, table: str, limit: int = 500) -> pd.DataFrame:
+        if table not in self.table_names():
+            return pd.DataFrame()
+        rows = self.rows(f'SELECT * FROM "{table}" LIMIT ?', (limit,))
+        frame = pd.DataFrame([dict(row) for row in rows])
+        for column in frame.columns:
+            if column.lower() in SENSITIVE_COLUMNS or "token" in column.lower():
+                frame[column] = frame[column].map(
+                    lambda value: "" if value in (None, "") else "[redacted]"
+                )
+        return frame
+
     @staticmethod
     def _part_content(data: dict[str, Any]) -> str:
         part_type = data.get("type")
@@ -342,3 +689,33 @@ class OpenCodeStore:
         if part_type == "patch":
             return str(data.get("patch") or json.dumps(data, ensure_ascii=False, default=str))
         return json.dumps(data, ensure_ascii=False, indent=2, default=str)
+
+    @staticmethod
+    def _task_id(data: dict[str, Any]) -> str:
+        if data.get("tool") != "task":
+            return ""
+        state = data.get("state") or {}
+        output = str(state.get("output") or "")
+        match = TASK_ID_RE.search(output)
+        return match.group(1) if match else ""
+
+
+def _task_description(input_data: Any) -> str:
+    if isinstance(input_data, dict):
+        description = input_data.get("description")
+        prompt = input_data.get("prompt")
+        agent = input_data.get("agent")
+        return str(description or prompt or agent or "")
+    return _preview(input_data, 240)
+
+
+def _log_timestamp(line: str) -> str:
+    parts = line.split()
+    if len(parts) >= 2 and parts[1].startswith("20"):
+        return parts[1]
+    return ""
+
+
+def _log_service(line: str) -> str:
+    match = re.search(r"\bservice=([^\s]+)", line)
+    return match.group(1) if match else ""
