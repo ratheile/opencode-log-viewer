@@ -10,7 +10,7 @@ import panel as pn
 
 from opencode_viewer.db import OpenCodeStore, resolve_db_path
 
-pn.extension("tabulator", sizing_mode="stretch_width")
+pn.extension("tabulator", "jsoneditor", sizing_mode="stretch_width")
 
 
 SESSION_COLUMNS = [
@@ -260,9 +260,11 @@ class OpenCodeDashboard:
             height=600,
             show_activity_dot=False,
         )
-        self.detail_pane = pn.pane.Markdown(
-            "_Select a message to see details._",
+        self.detail_pane = pn.Column(
+            pn.pane.Markdown("_Select a message to see details._"),
+            scroll=True,
             sizing_mode="stretch_width",
+            min_height=400,
         )
         self._parts_df: pd.DataFrame = pd.DataFrame()
         self._messages_df: pd.DataFrame = pd.DataFrame()
@@ -387,7 +389,7 @@ class OpenCodeDashboard:
         self.transcript_preview.object = self._transcript_markdown(transcript)
         self._parts_df = self._store.parts(session_id).reset_index(drop=True)
         self._messages_df = messages
-        self.detail_pane.object = "_Select a message to see details._"
+        self.detail_pane.objects = [pn.pane.Markdown("_Select a message to see details._")]
         self.chat_feed.objects = self._build_chat_messages(transcript)
         self.tools_table.value = self._display_frame(tools, TOOL_COLUMNS)
         self.tool_detail.object = self._tools_markdown(tools)
@@ -449,7 +451,7 @@ class OpenCodeDashboard:
                         "Chat",
                         pn.Row(
                             pn.Column(self.chat_feed, sizing_mode="stretch_both"),
-                            pn.Column(self.detail_pane, scroll=True, sizing_mode="stretch_both"),
+                            pn.Column(self.detail_pane, sizing_mode="stretch_both"),
                             sizing_mode="stretch_width",
                             min_height=500,
                         ),
@@ -532,7 +534,7 @@ class OpenCodeDashboard:
             table.value = pd.DataFrame()
         self.transcript_preview.object = ""
         self.chat_feed.objects = []
-        self.detail_pane.object = "_Select a message to see details._"
+        self.detail_pane.objects = [pn.pane.Markdown("_Select a message to see details._")]
         self._parts_df = pd.DataFrame()
         self._messages_df = pd.DataFrame()
         self.tool_detail.object = ""
@@ -632,7 +634,12 @@ class OpenCodeDashboard:
             role = str(row.get("role") or "")
             kind = str(row.get("type") or "")
             tool = str(row.get("tool") or "")
-            preview = str(row.get("preview") or "")
+
+            # Use full content for text/reasoning; preview summary for tool/patch
+            if kind in ("text", "reasoning"):
+                bubble_text = str(row.get("content") or row.get("preview") or "")
+            else:
+                bubble_text = str(row.get("preview") or "")
 
             part_row = self._parts_df.iloc[i] if aligned and i < len(self._parts_df) else None
             msg_row = None
@@ -653,14 +660,16 @@ class OpenCodeDashboard:
             else:
                 user_label, avatar = "assistant", "🤖"
 
-            content_md = pn.pane.Markdown(preview or "_no content_", sizing_mode="stretch_width")
+            content_md = pn.pane.Markdown(
+                bubble_text or "_no content_", sizing_mode="stretch_width"
+            )
 
             if part_row is not None:
                 btn = pn.widgets.Button(name="Details", button_type="light", width=80, height=26)
 
                 def make_handler(pr: pd.Series, mr: pd.Series | None) -> Any:
                     def handler(event: Any) -> None:
-                        self.detail_pane.object = self._part_detail_markdown(pr, mr)
+                        self.detail_pane.objects = self._build_detail_panel(pr, mr)
 
                     return handler
 
@@ -685,7 +694,7 @@ class OpenCodeDashboard:
 
         return result
 
-    def _part_detail_markdown(self, part_row: pd.Series, msg_row: pd.Series | None) -> str:
+    def _build_detail_panel(self, part_row: pd.Series, msg_row: pd.Series | None) -> list[Any]:
         role = (msg_row.get("role") or "") if msg_row is not None else ""
         agent = (msg_row.get("agent") or "") if msg_row is not None else ""
         model_id = (msg_row.get("model_id") or "") if msg_row is not None else ""
@@ -703,26 +712,57 @@ class OpenCodeDashboard:
         header += f" @ {created}"
         meta = f"**Agent:** {agent}  |  **Model:** {model_id}  |  **Status:** {status}"
 
-        lines = [header, "", meta, "", "---", ""]
+        widgets: list[Any] = [pn.pane.Markdown(f"{header}\n\n{meta}\n\n---")]
 
-        if content:
-            lines += ["### Content", "", content, ""]
+        if content and not is_tool:
+            widgets.append(pn.pane.Markdown("### Content"))
+            parsed_content = _try_parse_json(content)
+            if isinstance(parsed_content, (dict, list)):
+                widgets.append(
+                    pn.widgets.JSONEditor(
+                        value=parsed_content, mode="view",
+                        sizing_mode="stretch_width", height=300,
+                    )
+                )
+            else:
+                widgets.append(pn.pane.Markdown(content))
 
         if is_tool:
             tool_input = part_row.get("input")
             tool_output = part_row.get("output")
-            lines += ["### Input", ""]
-            lines.append(
-                _compact_value_markdown(tool_input)
-                if tool_input not in (None, "")
-                else "_No input._"
-            )
-            lines.append("")
+
+            widgets.append(pn.pane.Markdown("### Input"))
+            if tool_input not in (None, ""):
+                parsed = _try_parse_json(tool_input)
+                if isinstance(parsed, (dict, list)):
+                    widgets.append(
+                        pn.widgets.JSONEditor(
+                            value=parsed, mode="view",
+                            sizing_mode="stretch_width", height=300,
+                        )
+                    )
+                else:
+                    widgets.append(pn.pane.Markdown(_compact_value_markdown(tool_input)))
+            else:
+                widgets.append(pn.pane.Markdown("_No input._"))
+
             if tool_output not in (None, ""):
-                lines += ["### Output", "", _output_markdown(tool_output), ""]
+                widgets.append(pn.pane.Markdown("### Output"))
+                parsed = _try_parse_json(tool_output)
+                if isinstance(parsed, (dict, list)):
+                    widgets.append(
+                        pn.widgets.JSONEditor(
+                            value=parsed, mode="view",
+                            sizing_mode="stretch_width", height=400,
+                        )
+                    )
+                else:
+                    widgets.append(pn.pane.Markdown(_output_markdown(tool_output)))
 
         if error:
-            lines += ["### Error", "", f"```\n{_clip(str(error), 3000)}\n```", ""]
+            widgets.append(
+                pn.pane.Markdown(f"### Error\n\n```\n{_clip(str(error), 3000)}\n```")
+            )
 
         if msg_row is not None:
             cost = float(msg_row.get("cost") or 0)
@@ -730,18 +770,15 @@ class OpenCodeDashboard:
             token_input = int(msg_row.get("token_input") or 0)
             token_output = int(msg_row.get("token_output") or 0)
             cache_read = int(msg_row.get("cache_read") or 0)
-            lines += [
-                "---",
-                "",
-                "### Message Stats",
-                "",
-                (
+            widgets.append(
+                pn.pane.Markdown(
+                    f"---\n\n### Message Stats\n\n"
                     f"**Cost:** ${cost:.6f}  |  **Tokens:** {token_total:,} "
                     f"(in: {token_input:,}, out: {token_output:,}, cache read: {cache_read:,})"
-                ),
-            ]
+                )
+            )
 
-        return "\n".join(lines)
+        return widgets
 
     def _transcript_markdown(self, transcript: pd.DataFrame) -> str:
         if transcript.empty:
@@ -842,6 +879,18 @@ class OpenCodeDashboard:
         self.status.object = f"Database error: `{message}`"
         self.status.alert_type = "danger"
         self.status.visible = True
+
+
+def _try_parse_json(value: Any) -> Any:
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            print(f"Value is not valid JSON: {value}")
+            pass
+    return value
 
 
 def _clip(value: Any, limit: int = 5000) -> str:
