@@ -220,6 +220,11 @@ CHAT_MESSAGE_STYLESHEET = """
   border-left: 4px solid #0f766e;
 }
 
+.message.opencode-chat-tool-response {
+  background-color: #edf7f2;
+  border-left: 4px solid #15803d;
+}
+
 .message.opencode-chat-patch {
   background-color: #e9f8ee;
   border-left: 4px solid #2f855a;
@@ -760,6 +765,24 @@ class OpenCodeDashboard:
                     stylesheets=[CHAT_MESSAGE_STYLESHEET],
                 )
             )
+            if part_row is not None and kind == "tool":
+                response_text = _tool_response_markdown(part_row)
+                if response_text:
+                    result.append(
+                        pn.chat.ChatMessage(
+                            object=pn.pane.Markdown(
+                                response_text,
+                                css_classes=["message", "opencode-chat-tool-response"],
+                            ),
+                            user=f"tool response:{tool}" if tool else "tool response",
+                            avatar="R",
+                            show_reaction_icons=False,
+                            show_copy_icon=False,
+                            show_timestamp=False,
+                            sizing_mode="stretch_width",
+                            stylesheets=[CHAT_MESSAGE_STYLESHEET],
+                        )
+                    )
 
         return result
 
@@ -1089,6 +1112,17 @@ def _tool_row_markdown(row: pd.Series) -> str:
         "error": row.get("error"),
     }
     return _tool_payload_markdown(payload)
+
+
+def _tool_response_markdown(row: pd.Series | dict[str, Any]) -> str:
+    error = row.get("error")
+    if error:
+        return f"**Error**\n\n```\n{_clip(str(error), 3000)}\n```"
+
+    output = row.get("output")
+    if output in (None, ""):
+        return ""
+    return _output_markdown(output)
 
 
 def _tool_payload_markdown(payload: dict[str, Any]) -> str:

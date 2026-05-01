@@ -8,6 +8,7 @@ from opencode_viewer.app import (
     _discover_db_options,
     _initial_db_inputs,
     _tool_part_markdown,
+    _tool_response_markdown,
 )
 
 
@@ -63,6 +64,17 @@ def test_tool_part_markdown_summarizes_workflow_json() -> None:
     assert "Overall status: `active`" in text
     assert "Current phase: `run_training`" in text
     assert "| `run_training` | `running` | 2 | 1 |" in text
+
+
+def test_tool_response_markdown_uses_output_formatter() -> None:
+    text = _tool_response_markdown(
+        {
+            "output": json.dumps({"state": {"overall_status": "done", "phases": {}}}),
+            "error": "",
+        }
+    )
+
+    assert "Overall status: `done`" in text
 
 
 def test_chat_message_presentation_assigns_distinct_part_classes() -> None:
