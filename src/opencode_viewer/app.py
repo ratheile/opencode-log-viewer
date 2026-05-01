@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -245,6 +246,9 @@ CHAT_MESSAGE_STYLESHEET = """
 }
 """
 
+STEP_MESSAGE_TYPES = {"step-start", "step-finish"}
+CHAT_VIEW_HEIGHT = 850
+
 
 class OpenCodeDashboard:
     def __init__(
@@ -304,17 +308,22 @@ class OpenCodeDashboard:
         self.chat_feed = pn.chat.ChatFeed(
             objects=[],
             sizing_mode="stretch_width",
-            height=600,
+            height=CHAT_VIEW_HEIGHT,
             show_activity_dot=False,
         )
         self.detail_pane = pn.Column(
             pn.pane.Markdown("_Select a message to see details._"),
             scroll=True,
             sizing_mode="stretch_width",
-            min_height=400,
+            min_height=CHAT_VIEW_HEIGHT,
+        )
+        self.hide_step_messages = pn.widgets.Checkbox(
+            name="Hide step-start/step-finish messages",
+            value=False,
         )
         self._parts_df: pd.DataFrame = pd.DataFrame()
         self._messages_df: pd.DataFrame = pd.DataFrame()
+        self._transcript_df: pd.DataFrame = pd.DataFrame()
         self.tools_table = self._table(page_size=50)
         self.tool_detail = pn.pane.Markdown("")
         self.subagents_table = self._table(page_size=50)
@@ -339,6 +348,7 @@ class OpenCodeDashboard:
         self.db_select.param.watch(self._select_db, "value")
         self.session_select.param.watch(lambda _: self.refresh_detail(), "value")
         self.raw_table_select.param.watch(lambda _: self.refresh_raw_table(), "value")
+        self.hide_step_messages.param.watch(lambda _: self._rebuild_chat_feed(), "value")
 
         self.refresh_db_options(select_first=select_first_db)
         self.refresh()
@@ -436,8 +446,9 @@ class OpenCodeDashboard:
         self.transcript_preview.object = self._transcript_markdown(transcript)
         self._parts_df = self._store.parts(session_id).reset_index(drop=True)
         self._messages_df = messages
+        self._transcript_df = transcript
         self.detail_pane.objects = [pn.pane.Markdown("_Select a message to see details._")]
-        self.chat_feed.objects = self._build_chat_messages(transcript)
+        self._rebuild_chat_feed()
         self.tools_table.value = self._display_frame(tools, TOOL_COLUMNS)
         self.tool_detail.object = self._tools_markdown(tools)
         self.subagents_table.value = self._display_frame(subagents, SUBAGENT_COLUMNS)
@@ -496,11 +507,15 @@ class OpenCodeDashboard:
                 pn.Tabs(
                     (
                         "Chat",
-                        pn.Row(
-                            pn.Column(self.chat_feed, sizing_mode="stretch_both"),
-                            pn.Column(self.detail_pane, sizing_mode="stretch_both"),
+                        pn.Column(
+                            self.hide_step_messages,
+                            pn.Row(
+                                pn.Column(self.chat_feed, sizing_mode="stretch_both"),
+                                pn.Column(self.detail_pane, sizing_mode="stretch_both"),
+                                sizing_mode="stretch_width",
+                                min_height=CHAT_VIEW_HEIGHT,
+                            ),
                             sizing_mode="stretch_width",
-                            min_height=500,
                         ),
                     ),
                     (
@@ -584,6 +599,7 @@ class OpenCodeDashboard:
         self.detail_pane.objects = [pn.pane.Markdown("_Select a message to see details._")]
         self._parts_df = pd.DataFrame()
         self._messages_df = pd.DataFrame()
+        self._transcript_df = pd.DataFrame()
         self.tool_detail.object = ""
         self.subagent_note.object = ""
         self.output_detail.object = ""
@@ -670,11 +686,26 @@ class OpenCodeDashboard:
             ]
         )
 
+    def _filter_transcript(self, transcript: pd.DataFrame) -> pd.DataFrame:
+        if not self.hide_step_messages.value or transcript.empty:
+            return transcript
+        return transcript[~transcript["type"].isin(STEP_MESSAGE_TYPES)].reset_index(drop=True)
+
+    def _filter_parts(self, parts: pd.DataFrame) -> pd.DataFrame:
+        if not self.hide_step_messages.value or parts.empty:
+            return parts
+        return parts[~parts["type"].isin(STEP_MESSAGE_TYPES)].reset_index(drop=True)
+
+    def _rebuild_chat_feed(self) -> None:
+        filtered_transcript = self._filter_transcript(self._transcript_df)
+        self.chat_feed.objects = self._build_chat_messages(filtered_transcript)
+
     def _build_chat_messages(self, transcript: pd.DataFrame) -> list[pn.chat.ChatMessage]:
         if transcript.empty or self._parts_df.empty:
             return []
 
-        aligned = len(transcript) == len(self._parts_df)
+        parts = self._filter_parts(self._parts_df)
+        aligned = len(transcript) == len(parts)
         result = []
 
         for i, (_, row) in enumerate(transcript.iterrows()):
@@ -689,7 +720,7 @@ class OpenCodeDashboard:
             else:
                 bubble_text = str(row.get("preview") or "")
 
-            part_row = self._parts_df.iloc[i] if aligned and i < len(self._parts_df) else None
+            part_row = parts.iloc[i] if aligned and i < len(parts) else None
             msg_row = None
             if part_row is not None:
                 msg_id = str(part_row.get("message_id") or "")
@@ -1159,6 +1190,14 @@ def build_app(
     return OpenCodeDashboard(db_path, db_root).view()
 
 
+def _served_app_inputs(argv: list[str] | None = None) -> tuple[str | None, str | None]:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--db", default=None)
+    parser.add_argument("--db-root", default=None)
+    args, _ = parser.parse_known_args(sys.argv[1:] if argv is None else argv)
+    return args.db, args.db_root
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Serve the OpenCode Panel dashboard.")
     parser.add_argument(
@@ -1185,7 +1224,7 @@ def main() -> None:
     )
 
 
-app = build_app()
+app = build_app(*_served_app_inputs())
 app.servable(title="OpenCode Session Dashboard")
 
 
