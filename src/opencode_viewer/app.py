@@ -253,6 +253,7 @@ CHAT_MESSAGE_STYLESHEET = """
 
 STEP_MESSAGE_TYPES = {"step-start", "step-finish"}
 CHAT_VIEW_HEIGHT = 850
+AGENTIC_LOG_SERVICES = {"session", "session.prompt", "session.processor", "llm"}
 
 
 class OpenCodeDashboard:
@@ -325,9 +326,18 @@ class OpenCodeDashboard:
             name="Hide step-start/step-finish messages",
             value=False,
         )
+        self.show_tool_calls = pn.widgets.Checkbox(
+            name="Show tool calls",
+            value=True,
+        )
+        self.show_tool_results = pn.widgets.Checkbox(
+            name="Show tool results",
+            value=True,
+        )
         self._parts_df: pd.DataFrame = pd.DataFrame()
         self._messages_df: pd.DataFrame = pd.DataFrame()
         self._transcript_df: pd.DataFrame = pd.DataFrame()
+        self._logs_df: pd.DataFrame = pd.DataFrame()
         self.tools_table = self._table(page_size=50)
         self.tool_detail = pn.pane.Markdown("")
         self.subagents_table = self._table(page_size=50)
@@ -353,6 +363,8 @@ class OpenCodeDashboard:
         self.session_select.param.watch(lambda _: self.refresh_detail(), "value")
         self.raw_table_select.param.watch(lambda _: self.refresh_raw_table(), "value")
         self.hide_step_messages.param.watch(lambda _: self._rebuild_chat_feed(), "value")
+        self.show_tool_calls.param.watch(lambda _: self._rebuild_chat_feed(), "value")
+        self.show_tool_results.param.watch(lambda _: self._rebuild_chat_feed(), "value")
 
         self.refresh_db_options(select_first=select_first_db)
         self.refresh()
@@ -451,6 +463,7 @@ class OpenCodeDashboard:
         self._parts_df = self._store.parts(session_id).reset_index(drop=True)
         self._messages_df = messages
         self._transcript_df = transcript
+        self._logs_df = logs
         self.detail_pane.objects = [pn.pane.Markdown("_Select a message to see details._")]
         self._rebuild_chat_feed()
         self.tools_table.value = self._display_frame(tools, TOOL_COLUMNS)
@@ -512,7 +525,12 @@ class OpenCodeDashboard:
                     (
                         "Chat",
                         pn.Column(
-                            self.hide_step_messages,
+                            pn.Row(
+                                self.hide_step_messages,
+                                self.show_tool_calls,
+                                self.show_tool_results,
+                                sizing_mode="stretch_width",
+                            ),
                             pn.Row(
                                 pn.Column(self.chat_feed, sizing_mode="stretch_both"),
                                 pn.Column(self.detail_pane, sizing_mode="stretch_both"),
@@ -753,19 +771,26 @@ class OpenCodeDashboard:
             else:
                 content = content_md
 
-            result.append(
-                pn.chat.ChatMessage(
-                    object=content,
-                    user=user_label,
-                    avatar=avatar,
-                    show_reaction_icons=False,
-                    show_copy_icon=False,
-                    show_timestamp=False,
-                    sizing_mode="stretch_width",
-                    stylesheets=[CHAT_MESSAGE_STYLESHEET],
+            show_tool_call = kind != "tool" or self.show_tool_calls.value
+            if show_tool_call:
+                result.append(
+                    pn.chat.ChatMessage(
+                        object=content,
+                        user=user_label,
+                        avatar=avatar,
+                        show_reaction_icons=False,
+                        show_copy_icon=False,
+                        show_timestamp=False,
+                        sizing_mode="stretch_width",
+                        stylesheets=[CHAT_MESSAGE_STYLESHEET],
+                    )
                 )
-            )
-            if part_row is not None and kind == "tool":
+            if (
+                part_row is not None
+                and kind == "tool"
+                and self.show_tool_calls.value
+                and self.show_tool_results.value
+            ):
                 response_text = _tool_response_markdown(part_row)
                 if response_text:
                     result.append(
@@ -855,6 +880,9 @@ class OpenCodeDashboard:
             widgets.append(
                 pn.pane.Markdown(f"### Error\n\n```\n{_clip(str(error), 3000)}\n```")
             )
+
+        if is_tool:
+            widgets.append(pn.pane.Markdown(_agentic_log_markdown(self._logs_df)))
 
         if msg_row is not None:
             cost = float(msg_row.get("cost") or 0)
@@ -1179,6 +1207,22 @@ def _tool_output_summary(value: Any) -> str:
     if isinstance(decoded, list):
         return f"{len(decoded)} items"
     return str(decoded or "")
+
+
+def _agentic_log_markdown(logs: pd.DataFrame, limit: int = 8) -> str:
+    if logs.empty or "service" not in logs.columns or "text" not in logs.columns:
+        return "### Agentic Logs\n\n_No session agentic logs found._"
+
+    agentic_logs = logs[logs["service"].astype(str).isin(AGENTIC_LOG_SERVICES)]
+    if agentic_logs.empty:
+        return "### Agentic Logs\n\n_No session agentic logs found._"
+
+    lines = ["### Agentic Logs", ""]
+    for _, row in agentic_logs.head(limit).iterrows():
+        service = str(row.get("service") or "")
+        preview = _clip(row.get("text") or "", 700)
+        lines.append(f"- `{service}`: {preview}")
+    return "\n".join(lines)
 
 
 def _workflow_state_markdown(state: dict[str, Any]) -> str:

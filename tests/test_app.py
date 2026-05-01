@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pandas as pd
+
 from opencode_viewer.app import (
+    _agentic_log_markdown,
     _chat_message_presentation,
     _discover_db_options,
     _initial_db_inputs,
@@ -75,6 +78,23 @@ def test_tool_response_markdown_uses_output_formatter() -> None:
     )
 
     assert "Overall status: `done`" in text
+
+
+def test_agentic_log_markdown_prefers_session_agentic_logs() -> None:
+    logs = pd.DataFrame(
+        [
+            {"service": "session", "text": "session created"},
+            {"service": "llm", "text": "llm stream started"},
+            {"service": "tool.registry", "text": "tool registry event"},
+        ]
+    )
+
+    text = _agentic_log_markdown(logs, limit=5)
+
+    assert "### Agentic Logs" in text
+    assert "session created" in text
+    assert "llm stream started" in text
+    assert "tool registry event" not in text
 
 
 def test_chat_message_presentation_assigns_distinct_part_classes() -> None:
