@@ -253,6 +253,9 @@ CHAT_MESSAGE_STYLESHEET = """
 
 STEP_MESSAGE_TYPES = {"step-start", "step-finish"}
 CHAT_VIEW_HEIGHT = 850
+CHAT_PART_LIMIT = 180
+CHAT_BUBBLE_TEXT_LIMIT = 3000
+CHAT_TOOL_RESPONSE_TEXT_LIMIT = 3500
 AGENTIC_LOG_SERVICES = {"session", "session.prompt", "session.processor", "llm"}
 
 
@@ -332,7 +335,13 @@ class OpenCodeDashboard:
         )
         self.show_tool_results = pn.widgets.Checkbox(
             name="Show tool results",
-            value=True,
+            value=False,
+        )
+        self.chat_part_limit = pn.widgets.IntInput(
+            name="Chat parts",
+            value=CHAT_PART_LIMIT,
+            step=20,
+            width=120,
         )
         self._parts_df: pd.DataFrame = pd.DataFrame()
         self._messages_df: pd.DataFrame = pd.DataFrame()
@@ -365,6 +374,7 @@ class OpenCodeDashboard:
         self.hide_step_messages.param.watch(lambda _: self._rebuild_chat_feed(), "value")
         self.show_tool_calls.param.watch(lambda _: self._rebuild_chat_feed(), "value")
         self.show_tool_results.param.watch(lambda _: self._rebuild_chat_feed(), "value")
+        self.chat_part_limit.param.watch(lambda _: self._rebuild_chat_feed(), "value")
 
         self.refresh_db_options(select_first=select_first_db)
         self.refresh()
@@ -529,6 +539,7 @@ class OpenCodeDashboard:
                                 self.hide_step_messages,
                                 self.show_tool_calls,
                                 self.show_tool_results,
+                                self.chat_part_limit,
                                 sizing_mode="stretch_width",
                             ),
                             pn.Row(
@@ -722,33 +733,67 @@ class OpenCodeDashboard:
         filtered_transcript = self._filter_transcript(self._transcript_df)
         self.chat_feed.objects = self._build_chat_messages(filtered_transcript)
 
-    def _build_chat_messages(self, transcript: pd.DataFrame) -> list[pn.chat.ChatMessage]:
+    def _chat_part_limit(self) -> int:
+        value = self.chat_part_limit.value
+        if value in (None, ""):
+            return CHAT_PART_LIMIT
+        try:
+            return max(int(value), 0)
+        except (TypeError, ValueError):
+            return CHAT_PART_LIMIT
+
+    def _build_chat_messages(self, transcript: pd.DataFrame) -> list[Any]:
         if transcript.empty or self._parts_df.empty:
             return []
 
         parts = self._filter_parts(self._parts_df)
+        total_parts = len(transcript)
+        limit = self._chat_part_limit()
+        if limit and total_parts > limit:
+            transcript = transcript.tail(limit).reset_index(drop=True)
+            parts = parts.tail(limit).reset_index(drop=True)
+        else:
+            transcript = transcript.reset_index(drop=True)
+            parts = parts.reset_index(drop=True)
         aligned = len(transcript) == len(parts)
-        result = []
+        result: list[Any] = []
+
+        if limit and total_parts > limit:
+            result.append(
+                pn.pane.Markdown(
+                    f"_Showing latest {limit:,} of {total_parts:,} chat parts._",
+                    sizing_mode="stretch_width",
+                )
+            )
+
+        message_rows = (
+            self._messages_df.set_index("id") if "id" in self._messages_df.columns else None
+        )
 
         for i, (_, row) in enumerate(transcript.iterrows()):
             role = str(row.get("role") or "")
             kind = str(row.get("type") or "")
             tool = str(row.get("tool") or "")
+            if kind == "tool" and not self.show_tool_calls.value:
+                continue
+
             user_label, avatar, bubble_class = _chat_message_presentation(role, kind, tool)
 
             # Use full content for text/reasoning; preview summary for tool/patch
             if kind in ("text", "reasoning"):
-                bubble_text = str(row.get("content") or row.get("preview") or "")
+                bubble_text = _clip(
+                    str(row.get("content") or row.get("preview") or ""),
+                    CHAT_BUBBLE_TEXT_LIMIT,
+                )
             else:
                 bubble_text = str(row.get("preview") or "")
 
             part_row = parts.iloc[i] if aligned and i < len(parts) else None
             msg_row = None
-            if part_row is not None:
+            if part_row is not None and message_rows is not None:
                 msg_id = str(part_row.get("message_id") or "")
-                if msg_id:
-                    matches = self._messages_df[self._messages_df["id"] == msg_id]
-                    msg_row = matches.iloc[0] if not matches.empty else None
+                if msg_id and msg_id in message_rows.index:
+                    msg_row = message_rows.loc[msg_id]
 
             content_md = pn.pane.Markdown(
                 bubble_text or "_no content_",
@@ -771,27 +816,27 @@ class OpenCodeDashboard:
             else:
                 content = content_md
 
-            show_tool_call = kind != "tool" or self.show_tool_calls.value
-            if show_tool_call:
-                result.append(
-                    pn.chat.ChatMessage(
-                        object=content,
-                        user=user_label,
-                        avatar=avatar,
-                        show_reaction_icons=False,
-                        show_copy_icon=False,
-                        show_timestamp=False,
-                        sizing_mode="stretch_width",
-                        stylesheets=[CHAT_MESSAGE_STYLESHEET],
-                    )
+            result.append(
+                pn.chat.ChatMessage(
+                    object=content,
+                    user=user_label,
+                    avatar=avatar,
+                    show_reaction_icons=False,
+                    show_copy_icon=False,
+                    show_timestamp=False,
+                    sizing_mode="stretch_width",
+                    stylesheets=[CHAT_MESSAGE_STYLESHEET],
                 )
+            )
             if (
                 part_row is not None
                 and kind == "tool"
-                and self.show_tool_calls.value
                 and self.show_tool_results.value
             ):
-                response_text = _tool_response_markdown(part_row)
+                response_text = _clip(
+                    _tool_response_markdown(part_row),
+                    CHAT_TOOL_RESPONSE_TEXT_LIMIT,
+                )
                 if response_text:
                     result.append(
                         pn.chat.ChatMessage(
