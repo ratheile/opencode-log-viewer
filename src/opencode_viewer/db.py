@@ -7,7 +7,7 @@ import sqlite3
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -56,6 +56,18 @@ def _format_time_ms(value: Any) -> str:
     except (TypeError, ValueError):
         return ""
     return datetime.fromtimestamp(timestamp).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def _log_time_ms(value: str) -> int | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return int(parsed.timestamp() * 1000)
 
 
 def _tokens(data: dict[str, Any], key: str) -> int:
@@ -368,6 +380,8 @@ class OpenCodeStore:
                     "cache_write": _tokens(data, "cache_write"),
                     "cwd": path.get("cwd", ""),
                     "root": path.get("root", ""),
+                    "created_ms": row["time_created"],
+                    "updated_ms": row["time_updated"],
                     "created": _format_time_ms(row["time_created"]),
                     "updated": _format_time_ms(row["time_updated"]),
                     "raw": data,
@@ -412,6 +426,8 @@ class OpenCodeStore:
                     "output_len": len(str(output or "")),
                     "task_id": self._task_id(data),
                     "paths": _extract_paths(state.get("input")) + _extract_paths(output),
+                    "created_ms": row["time_created"],
+                    "updated_ms": row["time_updated"],
                     "created": _format_time_ms(row["time_created"]),
                     "updated": _format_time_ms(row["time_updated"]),
                     "preview": _preview(self._part_content(data)),
@@ -617,7 +633,9 @@ class OpenCodeStore:
 
     def logs(self, session_id: str | None = None) -> pd.DataFrame:
         if not self.log_dir.exists():
-            return pd.DataFrame(columns=["file", "line", "level", "timestamp", "service", "text"])
+            return pd.DataFrame(
+                columns=["file", "line", "level", "timestamp", "timestamp_ms", "service", "text"]
+            )
         records = []
         for path in sorted(self.log_dir.glob("*.log")):
             try:
@@ -627,12 +645,14 @@ class OpenCodeStore:
             for number, line in enumerate(lines, start=1):
                 if session_id and session_id not in line:
                     continue
+                timestamp = _log_timestamp(line)
                 records.append(
                     {
                         "file": path.name,
                         "line": number,
                         "level": line.split(maxsplit=1)[0] if line else "",
-                        "timestamp": _log_timestamp(line),
+                        "timestamp": timestamp,
+                        "timestamp_ms": _log_time_ms(timestamp),
                         "service": _log_service(line),
                         "text": line,
                         "preview": _preview(line, 500),

@@ -812,15 +812,15 @@ class OpenCodeDashboard:
         return result
 
     def _build_detail_panel(self, part_row: pd.Series, msg_row: pd.Series | None) -> list[Any]:
-        role = (msg_row.get("role") or "") if msg_row is not None else ""
-        agent = (msg_row.get("agent") or "") if msg_row is not None else ""
-        model_id = (msg_row.get("model_id") or "") if msg_row is not None else ""
-        kind = part_row.get("type") or ""
-        tool = part_row.get("tool") or ""
-        status = part_row.get("status") or ""
-        created = part_row.get("created") or ""
+        role = _string_value(msg_row.get("role")) if msg_row is not None else ""
+        agent = _string_value(msg_row.get("agent")) if msg_row is not None else ""
+        model_id = _string_value(msg_row.get("model_id")) if msg_row is not None else ""
+        kind = _string_value(part_row.get("type"))
+        tool = _string_value(part_row.get("tool"))
+        status = _string_value(part_row.get("status"))
+        created = _string_value(part_row.get("created"))
         is_tool = bool(part_row.get("is_tool"))
-        content = str(part_row.get("content") or "").strip()
+        content = _string_value(part_row.get("content")).strip()
         error = part_row.get("error")
 
         header = f"## {role} — {kind}"
@@ -847,9 +847,10 @@ class OpenCodeDashboard:
         if is_tool:
             tool_input = part_row.get("input")
             tool_output = part_row.get("output")
+            child_session_id = _string_value(part_row.get("task_id")).strip()
 
             widgets.append(pn.pane.Markdown("### Input"))
-            if tool_input not in (None, ""):
+            if _has_value(tool_input):
                 parsed = _try_parse_json(tool_input)
                 if isinstance(parsed, (dict, list)):
                     widgets.append(
@@ -863,10 +864,13 @@ class OpenCodeDashboard:
             else:
                 widgets.append(pn.pane.Markdown("_No input._"))
 
-            if tool_output not in (None, ""):
+            if _has_value(tool_output):
                 widgets.append(pn.pane.Markdown("### Output"))
                 parsed = _try_parse_json(tool_output)
+                if _workflow_state_from_value(tool_output):
+                    widgets.append(pn.pane.Markdown(_output_markdown(tool_output)))
                 if isinstance(parsed, (dict, list)):
+                    widgets.append(pn.pane.Markdown("#### Raw Output"))
                     widgets.append(
                         pn.widgets.JSONEditor(
                             value=parsed, mode="view",
@@ -876,13 +880,16 @@ class OpenCodeDashboard:
                 else:
                     widgets.append(pn.pane.Markdown(_output_markdown(tool_output)))
 
-        if error:
+            if tool == "task" and child_session_id:
+                widgets.append(self._agent_conversation_draft(child_session_id))
+
+        if _has_value(error):
             widgets.append(
                 pn.pane.Markdown(f"### Error\n\n```\n{_clip(str(error), 3000)}\n```")
             )
 
         if is_tool:
-            widgets.append(pn.pane.Markdown(_agentic_log_markdown(self._logs_df)))
+            widgets.append(pn.pane.Markdown(_sidecar_log_markdown(self._logs_df, part_row)))
 
         if msg_row is not None:
             cost = float(msg_row.get("cost") or 0)
@@ -922,6 +929,13 @@ class OpenCodeDashboard:
                 ]
             )
         return "\n".join(lines)
+
+    def _agent_conversation_draft(self, child_session_id: str) -> pn.pane.Markdown:
+        transcript = self._store.transcript(child_session_id)
+        if not transcript.empty:
+            transcript = transcript.copy()
+            transcript["preview"] = transcript.apply(_readable_part_preview, axis=1)
+        return pn.pane.Markdown(_agent_conversation_draft_markdown(child_session_id, transcript))
 
     def _tools_markdown(self, tools: pd.DataFrame) -> str:
         if tools.empty:
@@ -1011,6 +1025,36 @@ def _try_parse_json(value: Any) -> Any:
             print(f"Value is not valid JSON: {value}")
             pass
     return value
+
+
+def _is_missing(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value == ""
+    if isinstance(value, dict | list | tuple | set):
+        return False
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _has_value(value: Any) -> bool:
+    return not _is_missing(value)
+
+
+def _string_value(value: Any) -> str:
+    return "" if _is_missing(value) else str(value)
+
+
+def _numeric_ms(value: Any) -> int | None:
+    if _is_missing(value):
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def _clip(value: Any, limit: int = 5000) -> str:
@@ -1144,11 +1188,11 @@ def _tool_row_markdown(row: pd.Series) -> str:
 
 def _tool_response_markdown(row: pd.Series | dict[str, Any]) -> str:
     error = row.get("error")
-    if error:
+    if _has_value(error):
         return f"**Error**\n\n```\n{_clip(str(error), 3000)}\n```"
 
     output = row.get("output")
-    if output in (None, ""):
+    if not _has_value(output):
         return ""
     return _output_markdown(output)
 
@@ -1158,11 +1202,11 @@ def _tool_payload_markdown(payload: dict[str, Any]) -> str:
         f"**Tool:** `{payload.get('tool') or ''}`",
         f"**Status:** `{payload.get('status') or ''}`",
     ]
-    if payload.get("input") not in (None, ""):
+    if _has_value(payload.get("input")):
         lines.extend(["", "**Input**", "", _compact_value_markdown(payload.get("input"))])
-    if payload.get("error"):
+    if _has_value(payload.get("error")):
         lines.extend(["", "**Error**", "", f"```\n{_clip(payload.get('error'), 3000)}\n```"])
-    elif payload.get("output") not in (None, ""):
+    elif _has_value(payload.get("output")):
         lines.extend(["", "**Output**", "", _output_markdown(payload.get("output"))])
     return "\n".join(lines)
 
@@ -1182,10 +1226,22 @@ def _compact_value_markdown(value: Any) -> str:
     return f"```\n{_clip(decoded, 3000)}\n```"
 
 
+def _workflow_state_from_value(value: Any) -> dict[str, Any] | None:
+    decoded = _decode_jsonish(value)
+    if not isinstance(decoded, dict):
+        return None
+    state = decoded.get("state")
+    if isinstance(state, dict) and isinstance(state.get("phases"), dict):
+        return state
+    if isinstance(decoded.get("phases"), dict):
+        return decoded
+    return None
+
+
 def _output_markdown(value: Any) -> str:
     decoded = _decode_jsonish(value)
-    state = decoded.get("state") if isinstance(decoded, dict) else None
-    if isinstance(state, dict) and isinstance(state.get("phases"), dict):
+    state = _workflow_state_from_value(decoded)
+    if state is not None:
         return _workflow_state_markdown(state)
     if isinstance(decoded, dict | list):
         return f"```json\n{_clip(_preview_json(decoded, pretty=True), 5000)}\n```"
@@ -1193,8 +1249,10 @@ def _output_markdown(value: Any) -> str:
 
 
 def _tool_output_summary(value: Any) -> str:
+    if not _has_value(value):
+        return ""
     decoded = _decode_jsonish(value)
-    state = decoded.get("state") if isinstance(decoded, dict) else None
+    state = _workflow_state_from_value(decoded)
     if isinstance(state, dict):
         phases = state.get("phases") if isinstance(state.get("phases"), dict) else {}
         current = state.get("current_phase") or "unknown phase"
@@ -1223,6 +1281,146 @@ def _agentic_log_markdown(logs: pd.DataFrame, limit: int = 8) -> str:
         preview = _clip(row.get("text") or "", 700)
         lines.append(f"- `{service}`: {preview}")
     return "\n".join(lines)
+
+
+def _sidecar_log_markdown(
+    logs: pd.DataFrame,
+    part_row: pd.Series | None,
+    *,
+    limit: int = 24,
+    window_seconds: int = 90,
+) -> str:
+    if logs.empty or "text" not in logs.columns:
+        return "### Sidecar Logs\n\n_No sidecar logs found for this session._"
+
+    scoped = logs.copy()
+    scoped_text = scoped["text"].astype(str)
+    exact_mask = pd.Series(False, index=scoped.index)
+    selected_ids: list[str] = []
+    selected_at = ""
+
+    if part_row is not None:
+        selected_at = _string_value(part_row.get("created"))
+        for key in ("id", "message_id"):
+            value = _string_value(part_row.get(key)).strip()
+            if value:
+                selected_ids.append(value)
+        if selected_ids:
+            exact_mask = scoped_text.apply(lambda text: any(item in text for item in selected_ids))
+
+    target_ms = _numeric_ms(part_row.get("created_ms")) if part_row is not None else None
+    note = "_Showing the first sidecar log lines for this session._"
+    selected = pd.DataFrame()
+
+    if target_ms is not None and "timestamp_ms" in scoped.columns:
+        timestamp_ms = pd.to_numeric(scoped["timestamp_ms"], errors="coerce")
+        scoped["_distance_ms"] = (timestamp_ms - target_ms).abs()
+        time_mask = timestamp_ms.notna() & (scoped["_distance_ms"] <= window_seconds * 1000)
+        selected = scoped[time_mask | exact_mask].copy()
+        if selected.empty and timestamp_ms.notna().any():
+            selected = scoped[timestamp_ms.notna()].nsmallest(limit, "_distance_ms").copy()
+            nearest = int((selected["_distance_ms"].min() or 0) / 1000) if not selected.empty else 0
+            note = (
+                f"_No sidecar logs within +/-{window_seconds}s of the selected part; "
+                f"showing nearest lines ({nearest}s away)._"
+            )
+        else:
+            note = f"_Showing sidecar log lines within +/-{window_seconds}s of the selected part"
+            if exact_mask.any():
+                note += " plus exact message/part id matches"
+            note += "._"
+    elif exact_mask.any():
+        selected = scoped[exact_mask].copy()
+        note = "_Showing sidecar log lines that mention the selected message or part id._"
+    else:
+        selected = scoped.head(limit).copy()
+
+    if selected.empty:
+        return "### Sidecar Logs\n\n_No matching sidecar log lines found for this selected part._"
+
+    if {"file", "line"}.issubset(selected.columns):
+        selected = selected.drop_duplicates(subset=["file", "line"])
+    if "_distance_ms" in selected.columns and len(selected) > limit:
+        exact_selected = selected[exact_mask.reindex(selected.index, fill_value=False)]
+        if exact_selected.empty:
+            selected = selected.nsmallest(limit, "_distance_ms")
+        elif len(exact_selected) >= limit:
+            selected = exact_selected.nsmallest(limit, "_distance_ms")
+        else:
+            nearby_selected = selected.drop(exact_selected.index).nsmallest(
+                limit - len(exact_selected),
+                "_distance_ms",
+            )
+            selected = pd.concat([exact_selected, nearby_selected])
+    elif len(selected) > limit:
+        selected = selected.head(limit)
+
+    sort_columns = [column for column in ("timestamp_ms", "file", "line") if column in selected]
+    if sort_columns:
+        selected = selected.sort_values(sort_columns, na_position="last")
+
+    lines = ["### Sidecar Logs", ""]
+    if selected_at:
+        lines.extend([f"_Selected part time: `{selected_at}`._", ""])
+    lines.extend([note, ""])
+    for _, row in selected.iterrows():
+        location = f"{_string_value(row.get('file'))}:{_string_value(row.get('line'))}".strip(":")
+        timestamp = _string_value(row.get("timestamp"))
+        service = _string_value(row.get("service"))
+        level = _string_value(row.get("level"))
+        label = " | ".join(item for item in [timestamp, level, service, location] if item)
+        lines.extend(
+            [
+                f"#### {label or 'log line'}",
+                "",
+                f"```text\n{_clip(_string_value(row.get('text')), 1600)}\n```",
+                "",
+            ]
+        )
+    return "\n".join(lines).strip()
+
+
+def _agent_conversation_draft_markdown(
+    child_session_id: str,
+    transcript: pd.DataFrame,
+    *,
+    limit: int = 40,
+) -> str:
+    header = f"### Agent Conversation Draft `{child_session_id}`"
+    if transcript.empty:
+        return f"{header}\n\n_No child transcript found._"
+
+    lines = [header, ""]
+    for _, row in transcript.head(limit).iterrows():
+        role = str(row.get("role") or "part")
+        agent = str(row.get("agent") or "")
+        kind = str(row.get("type") or "")
+        tool = str(row.get("tool") or "")
+        status = str(row.get("status") or "")
+        created = str(row.get("created") or "")
+
+        if kind == "tool":
+            label = f"tool `{tool}`" if tool else "tool"
+            if status:
+                label = f"{label} - {status}"
+            content = _clip(_readable_part_preview(row), 1200)
+        else:
+            label_parts = [role]
+            if agent:
+                label_parts.append(agent)
+            if kind:
+                label_parts.append(kind)
+            label = " - ".join(label_parts)
+            content = _clip(str(row.get("content") or row.get("preview") or "").strip(), 1500)
+
+        if created:
+            label = f"{label} - {created}"
+        lines.extend([f"#### {label}", "", content or "_No content._", ""])
+
+    hidden = max(len(transcript) - limit, 0)
+    if hidden:
+        lines.append(f"_Showing first {limit} parts; {hidden} later parts omitted._")
+    return "\n".join(lines).strip()
 
 
 def _workflow_state_markdown(state: dict[str, Any]) -> str:

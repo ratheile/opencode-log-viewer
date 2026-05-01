@@ -221,14 +221,89 @@ def test_subagents_link_task_output_to_child_session(tmp_path: Path) -> None:
                 ),
             ),
         )
+        conn.execute(
+            "INSERT INTO message VALUES (?, ?, ?, ?, ?)",
+            (
+                "msg_child_user",
+                "ses_child",
+                1700000005000,
+                1700000005000,
+                json.dumps({"role": "user", "agent": ""}),
+            ),
+        )
+        conn.execute(
+            "INSERT INTO part VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "prt_child_user",
+                "msg_child_user",
+                "ses_child",
+                1700000005000,
+                1700000005000,
+                json.dumps({"type": "text", "text": "Child prompt text"}),
+            ),
+        )
+        conn.execute(
+            "INSERT INTO message VALUES (?, ?, ?, ?, ?)",
+            (
+                "msg_child_assistant",
+                "ses_child",
+                1700000006000,
+                1700000007000,
+                json.dumps(
+                    {
+                        "role": "assistant",
+                        "agent": "worker",
+                        "modelID": "gpt-child",
+                    }
+                ),
+            ),
+        )
+        conn.execute(
+            "INSERT INTO part VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "prt_child_text",
+                "msg_child_assistant",
+                "ses_child",
+                1700000006000,
+                1700000006000,
+                json.dumps({"type": "text", "text": "Assistant child response"}),
+            ),
+        )
+        conn.execute(
+            "INSERT INTO part VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "prt_child_tool",
+                "msg_child_assistant",
+                "ses_child",
+                1700000007000,
+                1700000007000,
+                json.dumps(
+                    {
+                        "type": "tool",
+                        "tool": "read",
+                        "state": {
+                            "status": "completed",
+                            "input": {"filePath": "/tmp/example.py"},
+                            "output": "child read output",
+                        },
+                    }
+                ),
+            ),
+        )
 
-    subagents = OpenCodeStore(db_path).subagents("ses_1")
-    sessions = OpenCodeStore(db_path).sessions(include_archived=True)
+    store = OpenCodeStore(db_path)
+    subagents = store.subagents("ses_1")
+    sessions = store.sessions(include_archived=True)
+    child_transcript = store.transcript("ses_child")
 
     assert subagents.iloc[0]["task_id"] == "ses_child"
     assert subagents.iloc[0]["child_title"] == "Child subagent"
     assert sessions[sessions["id"] == "ses_1"].iloc[0]["child_session_count"] == 1
     assert sessions[sessions["id"] == "ses_1"].iloc[0]["task_count"] == 1
+    assert "Child prompt text" in child_transcript.iloc[0]["content"]
+    assert "Assistant child response" in child_transcript.iloc[1]["content"]
+    assert child_transcript.iloc[2]["tool"] == "read"
+    assert "child read output" in child_transcript.iloc[2]["content"]
 
 
 def test_subagents_ignore_task_without_persisted_task_id(tmp_path: Path) -> None:
