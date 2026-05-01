@@ -305,17 +305,16 @@ class OpenCodeDashboard:
         self.messages_table = self._table(page_size=50)
         self.transcript_table = self._table(page_size=50)
         self.transcript_preview = pn.pane.Markdown("")
-        self.chat_feed = pn.chat.ChatFeed(
-            objects=[],
+        self.chat_feed = pn.Column(
+            scroll=True,
             sizing_mode="stretch_width",
             height=CHAT_VIEW_HEIGHT,
-            show_activity_dot=False,
         )
         self.detail_pane = pn.Column(
             pn.pane.Markdown("_Select a message to see details._"),
             scroll=True,
             sizing_mode="stretch_width",
-            min_height=CHAT_VIEW_HEIGHT,
+            height=CHAT_VIEW_HEIGHT,
         )
         self.hide_step_messages = pn.widgets.Checkbox(
             name="Hide step-start/step-finish messages",
