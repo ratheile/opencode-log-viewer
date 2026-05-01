@@ -254,6 +254,18 @@ class OpenCodeDashboard:
         self.messages_table = self._table(page_size=50)
         self.transcript_table = self._table(page_size=50)
         self.transcript_preview = pn.pane.Markdown("")
+        self.chat_feed = pn.chat.ChatFeed(
+            objects=[],
+            sizing_mode="stretch_width",
+            height=600,
+            show_activity_dot=False,
+        )
+        self.detail_pane = pn.pane.Markdown(
+            "_Select a message to see details._",
+            sizing_mode="stretch_width",
+        )
+        self._parts_df: pd.DataFrame = pd.DataFrame()
+        self._messages_df: pd.DataFrame = pd.DataFrame()
         self.tools_table = self._table(page_size=50)
         self.tool_detail = pn.pane.Markdown("")
         self.subagents_table = self._table(page_size=50)
@@ -373,6 +385,10 @@ class OpenCodeDashboard:
         self.messages_table.value = self._display_frame(messages, MESSAGE_COLUMNS)
         self.transcript_table.value = self._display_frame(transcript, TRANSCRIPT_COLUMNS)
         self.transcript_preview.object = self._transcript_markdown(transcript)
+        self._parts_df = self._store.parts(session_id).reset_index(drop=True)
+        self._messages_df = messages
+        self.detail_pane.object = "_Select a message to see details._"
+        self.chat_feed.objects = self._build_chat_messages(transcript)
         self.tools_table.value = self._display_frame(tools, TOOL_COLUMNS)
         self.tool_detail.object = self._tools_markdown(tools)
         self.subagents_table.value = self._display_frame(subagents, SUBAGENT_COLUMNS)
@@ -428,13 +444,28 @@ class OpenCodeDashboard:
             ),
             (
                 "Conversation & Messages",
-                pn.Column(
-                    pn.pane.Markdown(CONVERSATION_TEXT),
-                    pn.pane.Markdown("### Model Messages"),
-                    self.messages_table,
-                    pn.pane.Markdown("### Transcript Parts"),
-                    self.transcript_table,
-                    self.transcript_preview,
+                pn.Tabs(
+                    (
+                        "Chat",
+                        pn.Row(
+                            pn.Column(self.chat_feed, sizing_mode="stretch_both"),
+                            pn.Column(self.detail_pane, scroll=True, sizing_mode="stretch_both"),
+                            sizing_mode="stretch_width",
+                            min_height=500,
+                        ),
+                    ),
+                    (
+                        "Preview",
+                        pn.Column(
+                            pn.pane.Markdown(CONVERSATION_TEXT),
+                            pn.pane.Markdown("### Model Messages"),
+                            self.messages_table,
+                            pn.pane.Markdown("### Transcript Parts"),
+                            self.transcript_table,
+                            self.transcript_preview,
+                        ),
+                    ),
+                    sizing_mode="stretch_width",
                 ),
             ),
             (
@@ -500,6 +531,10 @@ class OpenCodeDashboard:
         ]:
             table.value = pd.DataFrame()
         self.transcript_preview.object = ""
+        self.chat_feed.objects = []
+        self.detail_pane.object = "_Select a message to see details._"
+        self._parts_df = pd.DataFrame()
+        self._messages_df = pd.DataFrame()
         self.tool_detail.object = ""
         self.subagent_note.object = ""
         self.output_detail.object = ""
@@ -585,6 +620,128 @@ class OpenCodeDashboard:
                 f"- Tokens: **{int(session.get('token_total', 0)):,}**",
             ]
         )
+
+    def _build_chat_messages(self, transcript: pd.DataFrame) -> list[pn.chat.ChatMessage]:
+        if transcript.empty or self._parts_df.empty:
+            return []
+
+        aligned = len(transcript) == len(self._parts_df)
+        result = []
+
+        for i, (_, row) in enumerate(transcript.iterrows()):
+            role = str(row.get("role") or "")
+            kind = str(row.get("type") or "")
+            tool = str(row.get("tool") or "")
+            preview = str(row.get("preview") or "")
+
+            part_row = self._parts_df.iloc[i] if aligned and i < len(self._parts_df) else None
+            msg_row = None
+            if part_row is not None:
+                msg_id = str(part_row.get("message_id") or "")
+                if msg_id:
+                    matches = self._messages_df[self._messages_df["id"] == msg_id]
+                    msg_row = matches.iloc[0] if not matches.empty else None
+
+            if kind == "tool" and tool:
+                user_label, avatar = f"tool:{tool}", "🔧"
+            elif kind == "reasoning":
+                user_label, avatar = "reasoning", "💭"
+            elif kind == "patch":
+                user_label, avatar = "patch", "📝"
+            elif role == "user":
+                user_label, avatar = "user", "👤"
+            else:
+                user_label, avatar = "assistant", "🤖"
+
+            content_md = pn.pane.Markdown(preview or "_no content_", sizing_mode="stretch_width")
+
+            if part_row is not None:
+                btn = pn.widgets.Button(name="Details", button_type="light", width=80, height=26)
+
+                def make_handler(pr: pd.Series, mr: pd.Series | None) -> Any:
+                    def handler(event: Any) -> None:
+                        self.detail_pane.object = self._part_detail_markdown(pr, mr)
+
+                    return handler
+
+                btn.on_click(make_handler(part_row, msg_row))
+                content: Any = pn.Column(
+                    content_md, pn.Row(pn.Spacer(), btn), sizing_mode="stretch_width"
+                )
+            else:
+                content = content_md
+
+            result.append(
+                pn.chat.ChatMessage(
+                    object=content,
+                    user=user_label,
+                    avatar=avatar,
+                    show_reaction_icons=False,
+                    show_copy_icon=False,
+                    show_timestamp=False,
+                    sizing_mode="stretch_width",
+                )
+            )
+
+        return result
+
+    def _part_detail_markdown(self, part_row: pd.Series, msg_row: pd.Series | None) -> str:
+        role = (msg_row.get("role") or "") if msg_row is not None else ""
+        agent = (msg_row.get("agent") or "") if msg_row is not None else ""
+        model_id = (msg_row.get("model_id") or "") if msg_row is not None else ""
+        kind = part_row.get("type") or ""
+        tool = part_row.get("tool") or ""
+        status = part_row.get("status") or ""
+        created = part_row.get("created") or ""
+        is_tool = bool(part_row.get("is_tool"))
+        content = str(part_row.get("content") or "").strip()
+        error = part_row.get("error")
+
+        header = f"## {role} — {kind}"
+        if tool:
+            header += f" `{tool}`"
+        header += f" @ {created}"
+        meta = f"**Agent:** {agent}  |  **Model:** {model_id}  |  **Status:** {status}"
+
+        lines = [header, "", meta, "", "---", ""]
+
+        if content:
+            lines += ["### Content", "", content, ""]
+
+        if is_tool:
+            tool_input = part_row.get("input")
+            tool_output = part_row.get("output")
+            lines += ["### Input", ""]
+            lines.append(
+                _compact_value_markdown(tool_input)
+                if tool_input not in (None, "")
+                else "_No input._"
+            )
+            lines.append("")
+            if tool_output not in (None, ""):
+                lines += ["### Output", "", _output_markdown(tool_output), ""]
+
+        if error:
+            lines += ["### Error", "", f"```\n{_clip(str(error), 3000)}\n```", ""]
+
+        if msg_row is not None:
+            cost = float(msg_row.get("cost") or 0)
+            token_total = int(msg_row.get("token_total") or 0)
+            token_input = int(msg_row.get("token_input") or 0)
+            token_output = int(msg_row.get("token_output") or 0)
+            cache_read = int(msg_row.get("cache_read") or 0)
+            lines += [
+                "---",
+                "",
+                "### Message Stats",
+                "",
+                (
+                    f"**Cost:** ${cost:.6f}  |  **Tokens:** {token_total:,} "
+                    f"(in: {token_input:,}, out: {token_output:,}, cache read: {cache_read:,})"
+                ),
+            ]
+
+        return "\n".join(lines)
 
     def _transcript_markdown(self, transcript: pd.DataFrame) -> str:
         if transcript.empty:
