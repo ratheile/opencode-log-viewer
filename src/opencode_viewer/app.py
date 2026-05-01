@@ -198,6 +198,53 @@ Raw tables preserve access to the underlying SQLite data. Use these when the
 summarized views hide a field you need.
 """.strip()
 
+CHAT_MESSAGE_STYLESHEET = """
+.message.opencode-chat-user {
+  background-color: #e8f1ff;
+  border-left: 4px solid #2563eb;
+}
+
+.message.opencode-chat-assistant {
+  background-color: #f8fafc;
+  border-left: 4px solid #94a3b8;
+}
+
+.message.opencode-chat-reasoning {
+  background-color: #fff7d6;
+  border-left: 4px solid #b7791f;
+}
+
+.message.opencode-chat-tool {
+  background-color: #e3f4f4;
+  border-left: 4px solid #0f766e;
+}
+
+.message.opencode-chat-patch {
+  background-color: #e9f8ee;
+  border-left: 4px solid #2f855a;
+}
+
+.message.opencode-chat-step-start {
+  background-color: #f0e8ff;
+  border-left: 4px solid #7c3aed;
+}
+
+.message.opencode-chat-step-finish {
+  background-color: #eceff3;
+  border-left: 4px solid #475569;
+}
+
+.message.opencode-chat-other {
+  background-color: #f6f0e8;
+  border-left: 4px solid #a16207;
+}
+
+.message[class*="opencode-chat-"] {
+  align-items: flex-start;
+  padding: 8px 10px;
+}
+"""
+
 
 class OpenCodeDashboard:
     def __init__(
@@ -634,6 +681,7 @@ class OpenCodeDashboard:
             role = str(row.get("role") or "")
             kind = str(row.get("type") or "")
             tool = str(row.get("tool") or "")
+            user_label, avatar, bubble_class = _chat_message_presentation(role, kind, tool)
 
             # Use full content for text/reasoning; preview summary for tool/patch
             if kind in ("text", "reasoning"):
@@ -649,19 +697,9 @@ class OpenCodeDashboard:
                     matches = self._messages_df[self._messages_df["id"] == msg_id]
                     msg_row = matches.iloc[0] if not matches.empty else None
 
-            if kind == "tool" and tool:
-                user_label, avatar = f"tool:{tool}", "🔧"
-            elif kind == "reasoning":
-                user_label, avatar = "reasoning", "💭"
-            elif kind == "patch":
-                user_label, avatar = "patch", "📝"
-            elif role == "user":
-                user_label, avatar = "user", "👤"
-            else:
-                user_label, avatar = "assistant", "🤖"
-
             content_md = pn.pane.Markdown(
-                bubble_text or "_no content_", sizing_mode="stretch_width"
+                bubble_text or "_no content_",
+                css_classes=["message", bubble_class],
             )
 
             if part_row is not None:
@@ -689,6 +727,7 @@ class OpenCodeDashboard:
                     show_copy_icon=False,
                     show_timestamp=False,
                     sizing_mode="stretch_width",
+                    stylesheets=[CHAT_MESSAGE_STYLESHEET],
                 )
             )
 
@@ -983,6 +1022,25 @@ def _readable_tool_preview(row: pd.Series | dict[str, Any]) -> str:
     summary = _tool_output_summary(output)
     prefix = f"{tool} {status}".strip()
     return _clip(f"{prefix}: {summary}" if summary else prefix, 280)
+
+
+def _chat_message_presentation(role: str, kind: str, tool: str) -> tuple[str, str, str]:
+    if kind == "tool":
+        label = f"tool:{tool}" if tool else "tool"
+        return label, "🔧", "opencode-chat-tool"
+    if kind == "reasoning":
+        return "reasoning", "💭", "opencode-chat-reasoning"
+    if kind == "patch":
+        return "patch", "📝", "opencode-chat-patch"
+    if kind == "step-start":
+        return "step:start", "S", "opencode-chat-step-start"
+    if kind == "step-finish":
+        return "step:finish", "F", "opencode-chat-step-finish"
+    if role == "user":
+        return "user", "👤", "opencode-chat-user"
+    if role == "assistant" or kind == "text":
+        return "assistant", "🤖", "opencode-chat-assistant"
+    return kind or role or "part", "?", "opencode-chat-other"
 
 
 def _tool_part_markdown(content: Any) -> str:

@@ -3,7 +3,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from opencode_viewer.app import _discover_db_options, _initial_db_inputs, _tool_part_markdown
+from opencode_viewer.app import (
+    _chat_message_presentation,
+    _discover_db_options,
+    _initial_db_inputs,
+    _tool_part_markdown,
+)
 
 
 def test_discover_db_options_labels_run_folders(tmp_path: Path) -> None:
@@ -58,3 +63,18 @@ def test_tool_part_markdown_summarizes_workflow_json() -> None:
     assert "Overall status: `active`" in text
     assert "Current phase: `run_training`" in text
     assert "| `run_training` | `running` | 2 | 1 |" in text
+
+
+def test_chat_message_presentation_assigns_distinct_part_classes() -> None:
+    assert _chat_message_presentation("assistant", "tool", "bash")[2] == "opencode-chat-tool"
+    assert _chat_message_presentation("assistant", "reasoning", "")[2] == (
+        "opencode-chat-reasoning"
+    )
+    assert _chat_message_presentation("assistant", "patch", "")[2] == "opencode-chat-patch"
+    assert _chat_message_presentation("assistant", "step-start", "")[2] == (
+        "opencode-chat-step-start"
+    )
+    assert _chat_message_presentation("assistant", "step-finish", "")[2] == (
+        "opencode-chat-step-finish"
+    )
+    assert _chat_message_presentation("user", "text", "")[2] == "opencode-chat-user"
