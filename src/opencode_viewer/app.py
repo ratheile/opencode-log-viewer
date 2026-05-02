@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -318,6 +319,7 @@ class OpenCodeDashboard:
             scroll=True,
             sizing_mode="stretch_width",
             height=CHAT_VIEW_HEIGHT,
+            stylesheets=[CHAT_MESSAGE_STYLESHEET],
         )
         self.detail_pane = pn.Column(
             pn.pane.Markdown("_Select a message to see details._"),
@@ -327,7 +329,7 @@ class OpenCodeDashboard:
         )
         self.hide_step_messages = pn.widgets.Checkbox(
             name="Hide step-start/step-finish messages",
-            value=False,
+            value=True,
         )
         self.show_tool_calls = pn.widgets.Checkbox(
             name="Show tool calls",
@@ -362,12 +364,12 @@ class OpenCodeDashboard:
         self.raw_table = self._table(page_size=100)
 
         self._sessions = pd.DataFrame()
+        self._all_sessions = pd.DataFrame()
         self._store = self._new_store()
 
         self.scan_button.on_click(self.refresh_db_options)
         self.refresh_button.on_click(self.refresh)
-        self.include_archived.param.watch(lambda _: self.refresh(), "value")
-        self.db_root_input.param.watch(lambda _: self.refresh_db_options(), "value")
+        self.include_archived.param.watch(lambda _: self._apply_archived_filter(), "value")
         self.db_select.param.watch(self._select_db, "value")
         self.session_select.param.watch(lambda _: self.refresh_detail(), "value")
         self.raw_table_select.param.watch(lambda _: self.refresh_raw_table(), "value")
@@ -418,7 +420,8 @@ class OpenCodeDashboard:
         del event
         self._store = self._new_store()
         try:
-            self._sessions = self._store.sessions(include_archived=self.include_archived.value)
+            self._all_sessions = self._store.sessions(include_archived=True)
+            self._sessions = self._filter_archived_sessions(self._all_sessions)
             db_overview = self._store.db_overview()
         except Exception as exc:  # noqa: BLE001 - surface DB errors in the dashboard
             self._set_error(str(exc))
@@ -439,6 +442,19 @@ class OpenCodeDashboard:
         self.sessions_table.value = self._display_frame(self._sessions, SESSION_COLUMNS)
         self.refresh_detail()
         self.refresh_raw_table()
+
+    def _filter_archived_sessions(self, sessions: pd.DataFrame) -> pd.DataFrame:
+        if self.include_archived.value or sessions.empty:
+            return sessions
+        if "time_archived" not in sessions.columns:
+            return sessions
+        return sessions[sessions["time_archived"].isna()].reset_index(drop=True)
+
+    def _apply_archived_filter(self) -> None:
+        self._sessions = self._filter_archived_sessions(self._all_sessions)
+        self.sessions_table.value = self._display_frame(self._sessions, SESSION_COLUMNS)
+        self._refresh_session_selector()
+        self.refresh_detail()
 
     def refresh_detail(self) -> None:
         session_id = self.session_select.value
@@ -461,10 +477,8 @@ class OpenCodeDashboard:
         outputs = self._store.tool_output_files()
 
         if not transcript.empty:
-            transcript = transcript.copy()
             transcript["preview"] = transcript.apply(_readable_part_preview, axis=1)
         if not tools.empty:
-            tools = tools.copy()
             tools["preview"] = tools.apply(_readable_tool_preview, axis=1)
 
         self.messages_table.value = self._display_frame(messages, MESSAGE_COLUMNS)
@@ -673,11 +687,11 @@ class OpenCodeDashboard:
     def _refresh_session_selector(self) -> None:
         current = self.session_select.value
         options = {}
-        for _, row in self._sessions.iterrows():
-            title = row.get("title") or row["id"]
-            marker = "child" if row.get("parent_id") else "root"
-            label = f"{row['updated']} | {marker} | {title}"
-            options[label] = row["id"]
+        for row in self._sessions.itertuples():
+            title = row.title or row.id
+            marker = "child" if row.parent_id else "root"
+            label = f"{row.updated} | {marker} | {title}"
+            options[label] = row.id
         self.session_select.options = options
         if current in options.values():
             self.session_select.value = current
@@ -770,23 +784,22 @@ class OpenCodeDashboard:
             self._messages_df.set_index("id") if "id" in self._messages_df.columns else None
         )
 
-        for i, (_, row) in enumerate(transcript.iterrows()):
-            role = str(row.get("role") or "")
-            kind = str(row.get("type") or "")
-            tool = str(row.get("tool") or "")
+        for i, row in enumerate(transcript.itertuples()):
+            role = str(row.role or "")
+            kind = str(row.type or "")
+            tool = str(row.tool or "")
             if kind == "tool" and not self.show_tool_calls.value:
                 continue
 
             user_label, avatar, bubble_class = _chat_message_presentation(role, kind, tool)
 
-            # Use full content for text/reasoning; preview summary for tool/patch
             if kind in ("text", "reasoning"):
                 bubble_text = _clip(
-                    str(row.get("content") or row.get("preview") or ""),
+                    str(row.content or row.preview or ""),
                     CHAT_BUBBLE_TEXT_LIMIT,
                 )
             else:
-                bubble_text = str(row.get("preview") or "")
+                bubble_text = str(row.preview or "")
 
             part_row = parts.iloc[i] if aligned and i < len(parts) else None
             msg_row = None
@@ -825,7 +838,6 @@ class OpenCodeDashboard:
                     show_copy_icon=False,
                     show_timestamp=False,
                     sizing_mode="stretch_width",
-                    stylesheets=[CHAT_MESSAGE_STYLESHEET],
                 )
             )
             if (
@@ -850,7 +862,6 @@ class OpenCodeDashboard:
                             show_copy_icon=False,
                             show_timestamp=False,
                             sizing_mode="stretch_width",
-                            stylesheets=[CHAT_MESSAGE_STYLESHEET],
                         )
                     )
 
@@ -957,17 +968,17 @@ class OpenCodeDashboard:
             return "No transcript parts found."
 
         lines = ["### Transcript Preview", ""]
-        for _, row in transcript.head(40).iterrows():
-            role = row.get("role") or "part"
-            kind = row.get("type") or ""
-            tool = f" `{row['tool']}`" if row.get("tool") else ""
+        for row in transcript.head(40).itertuples():
+            role = row.role or "part"
+            kind = row.type or ""
+            tool = f" `{row.tool}`" if row.tool else ""
             if kind == "tool":
-                content = _tool_part_markdown(row.get("content"))
+                content = _tool_part_markdown(row.content)
             else:
-                content = _clip(str(row.get("content") or "").strip(), 3000)
+                content = _clip(str(row.content or "").strip(), 3000)
             lines.extend(
                 [
-                    f"**{role}** - {kind}{tool} - {row.get('created', '')}",
+                    f"**{role}** - {kind}{tool} - {row.created}",
                     "",
                     content,
                     "",
@@ -986,10 +997,10 @@ class OpenCodeDashboard:
         if tools.empty:
             return "No tool calls found."
         lines = ["### Tool Detail Preview", ""]
-        for _, row in tools.head(8).iterrows():
+        for row in tools.head(8).itertuples():
             lines.extend(
                 [
-                    f"#### `{row.get('tool', '')}` - {row.get('status', '')}",
+                    f"#### `{row.tool or ''}` - {row.status or ''}",
                     "",
                     _tool_row_markdown(row),
                     "",
@@ -1001,12 +1012,12 @@ class OpenCodeDashboard:
         if outputs.empty:
             return "No DB-adjacent `tool-output` files found."
         lines = ["### Tool Output Files", ""]
-        for _, row in outputs.head(5).iterrows():
+        for row in outputs.head(5).itertuples():
             lines.extend(
                 [
-                    f"#### `{row.get('file', '')}` ({int(row.get('bytes', 0)):,} bytes)",
+                    f"#### `{row.file or ''}` ({int(row.bytes or 0):,} bytes)",
                     "",
-                    f"```\n{_clip(row.get('content') or '')}\n```",
+                    f"```\n{_clip(row.content or '')}\n```",
                     "",
                 ]
             )
@@ -1031,11 +1042,11 @@ class OpenCodeDashboard:
         if diffs.empty:
             return "No stored session diff found."
         lines = []
-        for _, diff in diffs.head(3).iterrows():
-            patch = str(diff.get("patch") or "")
+        for diff in diffs.head(3).itertuples():
+            patch = str(diff.patch or "")
             lines.extend(
                 [
-                    f"### Diff: `{diff.get('file', '')}`",
+                    f"### Diff: `{diff.file or ''}`",
                     "",
                     f"```diff\n{_clip(patch, 8000)}\n```",
                     "",
@@ -1176,19 +1187,38 @@ def _decode_jsonish(value: Any, max_depth: int = 3) -> Any:
     return current
 
 
-def _readable_part_preview(row: pd.Series) -> str:
-    if row.get("type") != "tool":
-        return str(row.get("preview") or "")
-    payload = _decode_jsonish(row.get("content"))
+def _readable_part_preview(row: Any) -> str:
+    row_type = (
+        getattr(row, "type", None)
+        or (row.get("type") if hasattr(row, "get") else None)
+    )
+    row_preview = (
+        getattr(row, "preview", None)
+        or (row.get("preview") if hasattr(row, "get") else None)
+    )
+    if row_type != "tool":
+        return str(row_preview or "")
+    row_content = (
+        getattr(row, "content", None)
+        or (row.get("content") if hasattr(row, "get") else None)
+    )
+    payload = _decode_jsonish(row_content)
     if not isinstance(payload, dict):
-        return str(row.get("preview") or "")
+        return str(row_preview or "")
     return _readable_tool_preview(payload)
 
 
-def _readable_tool_preview(row: pd.Series | dict[str, Any]) -> str:
-    tool = str(row.get("tool") or "tool")
-    status = str(row.get("status") or "")
-    output = row.get("output") if "output" in row else row.get("output_text")
+def _readable_tool_preview(row: Any) -> str:
+    if isinstance(row, tuple):
+        tool = str(getattr(row, "tool", None) or "tool")
+        status = str(getattr(row, "status", None) or "")
+        output = getattr(row, "output", None)
+        if output is None:
+            output = getattr(row, "output_text", None)
+    else:
+        tool = str(row.get("tool") or "tool")
+        status = str(row.get("status") or "")
+        output = row.get("output") if "output" in row else row.get("output_text")
     summary = _tool_output_summary(output)
     prefix = f"{tool} {status}".strip()
     return _clip(f"{prefix}: {summary}" if summary else prefix, 280)
@@ -1220,14 +1250,23 @@ def _tool_part_markdown(content: Any) -> str:
     return _tool_payload_markdown(payload)
 
 
-def _tool_row_markdown(row: pd.Series) -> str:
-    payload = {
-        "tool": row.get("tool"),
-        "status": row.get("status"),
-        "input": row.get("input"),
-        "output": row.get("output"),
-        "error": row.get("error"),
-    }
+def _tool_row_markdown(row: Any) -> str:
+    if isinstance(row, tuple):
+        payload = {
+            "tool": getattr(row, "tool", None),
+            "status": getattr(row, "status", None),
+            "input": getattr(row, "input", None),
+            "output": getattr(row, "output", None),
+            "error": getattr(row, "error", None),
+        }
+    else:
+        payload = {
+            "tool": row.get("tool"),
+            "status": row.get("status"),
+            "input": row.get("input"),
+            "output": row.get("output"),
+            "error": row.get("error"),
+        }
     return _tool_payload_markdown(payload)
 
 
@@ -1321,9 +1360,9 @@ def _agentic_log_markdown(logs: pd.DataFrame, limit: int = 8) -> str:
         return "### Agentic Logs\n\n_No session agentic logs found._"
 
     lines = ["### Agentic Logs", ""]
-    for _, row in agentic_logs.head(limit).iterrows():
-        service = str(row.get("service") or "")
-        preview = _clip(row.get("text") or "", 700)
+    for row in agentic_logs.head(limit).itertuples():
+        service = str(row.service or "")
+        preview = _clip(row.text or "", 700)
         lines.append(f"- `{service}`: {preview}")
     return "\n".join(lines)
 
@@ -1351,7 +1390,8 @@ def _sidecar_log_markdown(
             if value:
                 selected_ids.append(value)
         if selected_ids:
-            exact_mask = scoped_text.apply(lambda text: any(item in text for item in selected_ids))
+            pattern = "|".join(re.escape(item) for item in selected_ids)
+            exact_mask = scoped_text.str.contains(pattern, regex=True, na=False)
 
     target_ms = _numeric_ms(part_row.get("created_ms")) if part_row is not None else None
     note = "_Showing the first sidecar log lines for this session._"
@@ -1408,17 +1448,17 @@ def _sidecar_log_markdown(
     if selected_at:
         lines.extend([f"_Selected part time: `{selected_at}`._", ""])
     lines.extend([note, ""])
-    for _, row in selected.iterrows():
-        location = f"{_string_value(row.get('file'))}:{_string_value(row.get('line'))}".strip(":")
-        timestamp = _string_value(row.get("timestamp"))
-        service = _string_value(row.get("service"))
-        level = _string_value(row.get("level"))
+    for row in selected.itertuples():
+        location = f"{_string_value(row.file)}:{_string_value(row.line)}".strip(":")
+        timestamp = _string_value(row.timestamp)
+        service = _string_value(row.service)
+        level = _string_value(row.level)
         label = " | ".join(item for item in [timestamp, level, service, location] if item)
         lines.extend(
             [
                 f"#### {label or 'log line'}",
                 "",
-                f"```text\n{_clip(_string_value(row.get('text')), 1600)}\n```",
+                f"```text\n{_clip(_string_value(row.text), 1600)}\n```",
                 "",
             ]
         )
@@ -1436,13 +1476,13 @@ def _agent_conversation_draft_markdown(
         return f"{header}\n\n_No child transcript found._"
 
     lines = [header, ""]
-    for _, row in transcript.head(limit).iterrows():
-        role = str(row.get("role") or "part")
-        agent = str(row.get("agent") or "")
-        kind = str(row.get("type") or "")
-        tool = str(row.get("tool") or "")
-        status = str(row.get("status") or "")
-        created = str(row.get("created") or "")
+    for row in transcript.head(limit).itertuples():
+        role = str(row.role or "part")
+        agent = str(row.agent or "")
+        kind = str(row.type or "")
+        tool = str(row.tool or "")
+        status = str(row.status or "")
+        created = str(row.created or "")
 
         if kind == "tool":
             label = f"tool `{tool}`" if tool else "tool"
@@ -1456,7 +1496,7 @@ def _agent_conversation_draft_markdown(
             if kind:
                 label_parts.append(kind)
             label = " - ".join(label_parts)
-            content = _clip(str(row.get("content") or row.get("preview") or "").strip(), 1500)
+            content = _clip(str(row.content or row.preview or "").strip(), 1500)
 
         if created:
             label = f"{label} - {created}"

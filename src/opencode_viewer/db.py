@@ -143,6 +143,9 @@ class OpenCodeStore:
     def __init__(self, db_path: str | Path | None = None, retries: int = 3) -> None:
         self.db_path = resolve_db_path(db_path)
         self.retries = retries
+        self._conn: sqlite3.Connection | None = None
+        self._cache: dict[str, pd.DataFrame] = {}
+        self._table_names_cache: list[str] | None = None
 
     @property
     def storage_dir(self) -> Path:
@@ -157,19 +160,29 @@ class OpenCodeStore:
         return self.db_path.parent / "tool-output"
 
     def connect(self) -> sqlite3.Connection:
-        if not self.db_path.exists():
-            raise FileNotFoundError(f"Database not found: {self.db_path}")
-        conn = sqlite3.connect(_sqlite_uri(self.db_path), uri=True, timeout=5)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA query_only = ON")
-        return conn
+        if self._conn is None:
+            if not self.db_path.exists():
+                raise FileNotFoundError(f"Database not found: {self.db_path}")
+            self._conn = sqlite3.connect(_sqlite_uri(self.db_path), uri=True, timeout=5)
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA query_only = ON")
+        return self._conn
+
+    def close(self) -> None:
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
+
+    def clear_cache(self) -> None:
+        self._cache.clear()
+        self._table_names_cache = None
 
     def rows(self, query: str, params: Iterable[Any] = ()) -> list[sqlite3.Row]:
         last_error: sqlite3.OperationalError | None = None
         for attempt in range(self.retries):
             try:
-                with self.connect() as conn:
-                    return conn.execute(query, tuple(params)).fetchall()
+                conn = self.connect()
+                return conn.execute(query, tuple(params)).fetchall()
             except sqlite3.OperationalError as exc:
                 last_error = exc
                 if "locked" not in str(exc).lower() or attempt == self.retries - 1:
@@ -180,6 +193,8 @@ class OpenCodeStore:
         return []
 
     def table_names(self) -> list[str]:
+        if self._table_names_cache is not None:
+            return self._table_names_cache
         rows = self.rows(
             """
             SELECT name
@@ -188,7 +203,8 @@ class OpenCodeStore:
             ORDER BY name
             """
         )
-        return [str(row["name"]) for row in rows]
+        self._table_names_cache = [str(row["name"]) for row in rows]
+        return self._table_names_cache
 
     def has_table(self, table: str) -> bool:
         return table in set(self.table_names())
@@ -316,33 +332,119 @@ class OpenCodeStore:
         return pd.DataFrame([dict(row) for row in rows])
 
     def message_stats(self) -> pd.DataFrame:
-        messages = self.messages()
-        if messages.empty:
-            return pd.DataFrame()
-        grouped = messages.groupby("session_id", as_index=False).agg(
-            total_cost=("cost", "sum"),
-            token_total=("token_total", "sum"),
-            token_input=("token_input", "sum"),
-            token_output=("token_output", "sum"),
-            token_reasoning=("token_reasoning", "sum"),
-            cache_read=("cache_read", "sum"),
-            cache_write=("cache_write", "sum"),
+        if not self.has_table("message"):
+            return pd.DataFrame(
+                columns=[
+                    "session_id",
+                    "total_cost",
+                    "token_total",
+                    "token_input",
+                    "token_output",
+                    "token_reasoning",
+                    "cache_read",
+                    "cache_write",
+                ]
+            )
+        rows = self.rows(
+            """
+            SELECT
+                session_id,
+                ROUND(
+                    SUM(CAST(COALESCE(json_extract(data, '$.cost'), 0) AS REAL)),
+                    6
+                ) AS total_cost,
+                SUM(CAST(
+                    COALESCE(json_extract(data, '$.tokens.total'), 0) AS INTEGER
+                )) AS token_total,
+                SUM(CAST(
+                    COALESCE(json_extract(data, '$.tokens.input'), 0) AS INTEGER
+                )) AS token_input,
+                SUM(CAST(
+                    COALESCE(json_extract(data, '$.tokens.output'), 0) AS INTEGER
+                )) AS token_output,
+                SUM(CAST(
+                    COALESCE(json_extract(data, '$.tokens.reasoning'), 0) AS INTEGER
+                )) AS token_reasoning,
+                SUM(CAST(
+                    COALESCE(json_extract(data, '$.tokens.cache.read'), 0) AS INTEGER
+                )) AS cache_read,
+                SUM(CAST(
+                    COALESCE(json_extract(data, '$.tokens.cache.write'), 0) AS INTEGER
+                )) AS cache_write
+            FROM message
+            GROUP BY session_id
+            """
         )
-        grouped["total_cost"] = grouped["total_cost"].round(6)
-        return grouped
+        if not rows:
+            return pd.DataFrame(
+                columns=[
+                    "session_id",
+                    "total_cost",
+                    "token_total",
+                    "token_input",
+                    "token_output",
+                    "token_reasoning",
+                    "cache_read",
+                    "cache_write",
+                ]
+            )
+        records = []
+        for row in rows:
+            records.append(
+                {
+                    "session_id": row["session_id"],
+                    "total_cost": row["total_cost"],
+                    "token_total": row["token_total"],
+                    "token_input": row["token_input"],
+                    "token_output": row["token_output"],
+                    "token_reasoning": row["token_reasoning"],
+                    "cache_read": row["cache_read"],
+                    "cache_write": row["cache_write"],
+                }
+            )
+        return pd.DataFrame(records)
 
     def part_stats(self) -> pd.DataFrame:
-        parts = self.all_parts()
-        if parts.empty:
-            return pd.DataFrame()
-        grouped = parts.groupby("session_id", as_index=False).agg(
-            tool_count=("is_tool", "sum"),
-            task_count=("is_task", "sum"),
-            error_count=("is_error", "sum"),
+        if not self.has_table("part"):
+            return pd.DataFrame(columns=["session_id", "tool_count", "task_count", "error_count"])
+        rows = self.rows(
+            """
+            SELECT
+                session_id,
+                SUM(CASE
+                    WHEN json_extract(data, '$.type') = 'tool' THEN 1 ELSE 0
+                END) AS tool_count,
+                SUM(CASE
+                    WHEN json_extract(data, '$.type') = 'tool'
+                         AND json_extract(data, '$.tool') = 'task' THEN 1 ELSE 0
+                END) AS task_count,
+                SUM(CASE
+                    WHEN json_extract(data, '$.state.status') = 'error'
+                         OR json_extract(data, '$.state.error') IS NOT NULL THEN 1 ELSE 0
+                END) AS error_count
+            FROM part
+            GROUP BY session_id
+            """
         )
-        return grouped
+        if not rows:
+            return pd.DataFrame(columns=["session_id", "tool_count", "task_count", "error_count"])
+        records = []
+        for row in rows:
+            records.append(
+                {
+                    "session_id": row["session_id"],
+                    "tool_count": row["tool_count"],
+                    "task_count": row["task_count"],
+                    "error_count": row["error_count"],
+                }
+            )
+        return pd.DataFrame(records)
 
     def messages(self, session_id: str | None = None) -> pd.DataFrame:
+        if session_id is not None:
+            cache_key = f"messages:{session_id}"
+            if cache_key in self._cache:
+                return self._cache[cache_key]
         where = ""
         params: tuple[str, ...] = ()
         if session_id:
@@ -387,9 +489,16 @@ class OpenCodeStore:
                     "raw": data,
                 }
             )
-        return pd.DataFrame(records)
+        result = pd.DataFrame(records)
+        if session_id is not None:
+            self._cache[cache_key] = result
+        return result
 
     def all_parts(self, session_id: str | None = None) -> pd.DataFrame:
+        if session_id is not None:
+            cache_key = f"parts:{session_id}"
+            if cache_key in self._cache:
+                return self._cache[cache_key]
         where = ""
         params: tuple[str, ...] = ()
         if session_id:
@@ -412,6 +521,7 @@ class OpenCodeStore:
             output = state.get("output") or state.get("out")
             error = state.get("error")
             tool = data.get("tool", "")
+            content = self._part_content(data)
             records.append(
                 {
                     "id": row["id"],
@@ -430,15 +540,18 @@ class OpenCodeStore:
                     "updated_ms": row["time_updated"],
                     "created": _format_time_ms(row["time_created"]),
                     "updated": _format_time_ms(row["time_updated"]),
-                    "preview": _preview(self._part_content(data)),
-                    "content": self._part_content(data),
+                    "preview": _preview(content),
+                    "content": content,
                     "is_tool": part_type == "tool",
                     "is_task": part_type == "tool" and tool == "task",
                     "is_error": state.get("status") == "error" or bool(error),
                     "raw": data,
                 }
             )
-        return pd.DataFrame(records)
+        result = pd.DataFrame(records)
+        if session_id is not None:
+            self._cache[cache_key] = result
+        return result
 
     def parts(self, session_id: str) -> pd.DataFrame:
         return self.all_parts(session_id)
@@ -451,19 +564,19 @@ class OpenCodeStore:
 
         message_meta = messages.set_index("id")[["role", "agent", "model_id"]].to_dict("index")
         records = []
-        for _, part in parts.iterrows():
-            meta = message_meta.get(part["message_id"], {})
+        for part in parts.itertuples():
+            meta = message_meta.get(part.message_id, {})
             records.append(
                 {
-                    "created": part["created"],
+                    "created": part.created,
                     "role": meta.get("role", ""),
                     "agent": meta.get("agent", ""),
                     "model_id": meta.get("model_id", ""),
-                    "type": part["type"],
-                    "tool": part["tool"],
-                    "status": part["status"],
-                    "preview": part["preview"],
-                    "content": part["content"],
+                    "type": part.type,
+                    "tool": part.tool,
+                    "status": part.status,
+                    "preview": part.preview,
+                    "content": part.content,
                 }
             )
         return pd.DataFrame(records)
@@ -517,18 +630,19 @@ class OpenCodeStore:
         tasks = self.tools(session_id)
         records = []
         if not tasks.empty:
-            for _, task in tasks[tasks["tool"] == "task"].iterrows():
-                child_id = task.get("task_id") or ""
+            task_rows = tasks[tasks["tool"] == "task"]
+            for task in task_rows.itertuples():
+                child_id = task.task_id or ""
                 if not child_id:
                     continue
                 child = child_records.pop(child_id, {})
                 records.append(
                     {
-                        "created": task.get("created", ""),
-                        "status": task.get("status", ""),
+                        "created": task.created or "",
+                        "status": task.status or "",
                         "task_id": child_id,
-                        "description": _task_description(task.get("input")),
-                        "result_preview": _preview(task.get("output_text"), 500),
+                        "description": _task_description(task.input),
+                        "result_preview": _preview(task.output_text, 500),
                         **child,
                     }
                 )
@@ -552,10 +666,10 @@ class OpenCodeStore:
             return pd.DataFrame()
 
         latest_state: dict[str, Any] = {}
-        for _, row in tools.iterrows():
-            if not str(row.get("tool", "")).startswith("validate_paper_workflow_"):
+        for row in tools.itertuples():
+            if not str(row.tool or "").startswith("validate_paper_workflow_"):
                 continue
-            output = _load_json(str(row.get("output") or ""))
+            output = _load_json(str(row.output or ""))
             state = output.get("state") if isinstance(output.get("state"), dict) else output
             if isinstance(state, dict) and state.get("phases"):
                 latest_state = state
@@ -582,13 +696,13 @@ class OpenCodeStore:
 
     def artifact_paths(self, session_id: str) -> pd.DataFrame:
         records = []
-        for _, row in self.parts(session_id).iterrows():
-            for path in row.get("paths") or []:
+        for row in self.parts(session_id).itertuples():
+            for path in row.paths or []:
                 records.append(
                     {
-                        "created": row.get("created", ""),
-                        "source": row.get("tool") or row.get("type", ""),
-                        "status": row.get("status", ""),
+                        "created": row.created,
+                        "source": row.tool or row.type,
+                        "status": row.status,
                         "path": path,
                     }
                 )
